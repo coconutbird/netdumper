@@ -290,7 +290,8 @@ pub fn extract_entry_point_from_pe(pe_data: &[u8]) -> u32 {
     if pe_data.len() < 0x40 {
         return 0;
     }
-    let e_lfanew = u32::from_le_bytes([pe_data[0x3C], pe_data[0x3D], pe_data[0x3E], pe_data[0x3F]]) as usize;
+    let e_lfanew =
+        u32::from_le_bytes([pe_data[0x3C], pe_data[0x3D], pe_data[0x3E], pe_data[0x3F]]) as usize;
 
     // Verify PE signature
     if pe_data.len() < e_lfanew + 4 || &pe_data[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
@@ -341,7 +342,8 @@ pub fn extract_entry_point_from_pe(pe_data: &[u8]) -> u32 {
     // Convert RVA to file offset (simple: for our reconstructed PEs, .text is at 0x1000 and file offset 0x200)
     // For real PEs, we'd need to walk section headers
     let sections_offset = opt_offset + size_of_optional_header;
-    let num_sections = u16::from_le_bytes([pe_data[coff_offset + 2], pe_data[coff_offset + 3]]) as usize;
+    let num_sections =
+        u16::from_le_bytes([pe_data[coff_offset + 2], pe_data[coff_offset + 3]]) as usize;
 
     let mut clr_file_offset = 0usize;
     for i in 0..num_sections {
@@ -1892,6 +1894,7 @@ pub fn extract_assembly_name_from_metadata(pe_data: &[u8]) -> Option<String> {
 }
 
 /// Parse the #~ stream and extract the assembly name from the Assembly table.
+/// Falls back to Module table name if Assembly table is not present.
 fn extract_assembly_name_from_tilde_stream(tilde: &[u8], strings: &[u8]) -> Option<String> {
     // #~ stream header:
     // Reserved: u32 (0)
@@ -1916,15 +1919,8 @@ fn extract_assembly_name_from_tilde_stream(tilde: &[u8], strings: &[u8]) -> Opti
         tilde[8], tilde[9], tilde[10], tilde[11], tilde[12], tilde[13], tilde[14], tilde[15],
     ]);
 
-    // Count present tables and find Assembly table (0x20 = bit 32)
-    let assembly_table_bit = 1u64 << 0x20;
-    if valid & assembly_table_bit == 0 {
-        return None; // No Assembly table
-    }
-
     // Read row counts for all present tables
     let mut pos = 24usize; // After header
-    let mut assembly_table_offset = 0usize;
     let mut row_counts: Vec<u32> = Vec::new();
 
     for i in 0..64 {
@@ -1939,20 +1935,85 @@ fn extract_assembly_name_from_tilde_stream(tilde: &[u8], strings: &[u8]) -> Opti
         }
     }
 
-    // Calculate offset to Assembly table by summing sizes of preceding tables
     let tables_start = pos;
+
+    // Check if Assembly table (0x20) exists
+    let assembly_table_bit = 1u64 << 0x20;
+    let has_assembly_table = valid & assembly_table_bit != 0;
+
+    // Check if Module table (0x00) exists - it should always exist
+    let module_table_bit = 1u64 << 0x00;
+    let has_module_table = valid & module_table_bit != 0;
+
+    // Try Assembly table first, then fall back to Module table
+    if has_assembly_table {
+        if let Some(name) = extract_name_from_assembly_table(
+            tilde,
+            strings,
+            &row_counts,
+            valid,
+            tables_start,
+            string_idx_size,
+            guid_idx_size,
+            blob_idx_size,
+        ) {
+            return Some(name);
+        }
+    }
+
+    // Fall back to Module table
+    if has_module_table {
+        if let Some(name) = extract_name_from_module_table(
+            tilde,
+            strings,
+            tables_start,
+            string_idx_size,
+        ) {
+            return Some(name);
+        }
+    }
+
+    None
+}
+
+/// Extract name from the Assembly table (0x20).
+fn extract_name_from_assembly_table(
+    tilde: &[u8],
+    strings: &[u8],
+    row_counts: &[u32],
+    valid: u64,
+    tables_start: usize,
+    string_idx_size: usize,
+    guid_idx_size: usize,
+    blob_idx_size: usize,
+) -> Option<String> {
+    // Calculate offset to Assembly table by summing sizes of preceding tables
     let mut current_offset = tables_start;
 
     for i in 0..64 {
         if valid & (1u64 << i) != 0 {
             if i == 0x20 {
-                assembly_table_offset = current_offset;
-                break;
+                // Found Assembly table
+                // Assembly table row format (ECMA-335 II.22.2):
+                // HashAlgId: u32
+                // MajorVersion: u16
+                // MinorVersion: u16
+                // BuildNumber: u16
+                // RevisionNumber: u16
+                // Flags: u32
+                // PublicKey: Blob index
+                // Name: String index
+                // Culture: String index
+
+                let name_offset_in_row = 4 + 2 + 2 + 2 + 2 + 4 + blob_idx_size;
+                let name_pos = current_offset + name_offset_in_row;
+
+                return read_string_from_heap(tilde, strings, name_pos, string_idx_size);
             }
             // Calculate row size for this table
             let row_size = get_table_row_size(
                 i,
-                &row_counts,
+                row_counts,
                 valid,
                 string_idx_size,
                 guid_idx_size,
@@ -1964,24 +2025,37 @@ fn extract_assembly_name_from_tilde_stream(tilde: &[u8], strings: &[u8]) -> Opti
         }
     }
 
-    if assembly_table_offset == 0 {
-        return None;
-    }
+    None
+}
 
-    // Assembly table row format (ECMA-335 II.22.2):
-    // HashAlgId: u32
-    // MajorVersion: u16
-    // MinorVersion: u16
-    // BuildNumber: u16
-    // RevisionNumber: u16
-    // Flags: u32
-    // PublicKey: Blob index
-    // Name: String index
-    // Culture: String index
+/// Extract name from the Module table (0x00).
+/// Module table row format (ECMA-335 II.22.30):
+/// - Generation: u16 (2 bytes)
+/// - Name: String index
+/// - Mvid: GUID index
+/// - EncId: GUID index
+/// - EncBaseId: GUID index
+fn extract_name_from_module_table(
+    tilde: &[u8],
+    strings: &[u8],
+    tables_start: usize,
+    string_idx_size: usize,
+) -> Option<String> {
+    // Module table is always table 0, so it starts right at tables_start
+    // Name is at offset 2 (after Generation: u16)
+    let name_offset_in_row = 2;
+    let name_pos = tables_start + name_offset_in_row;
 
-    let name_offset_in_row = 4 + 2 + 2 + 2 + 2 + 4 + blob_idx_size;
-    let name_pos = assembly_table_offset + name_offset_in_row;
+    read_string_from_heap(tilde, strings, name_pos, string_idx_size)
+}
 
+/// Read a string from the #Strings heap given a position in the tilde stream.
+fn read_string_from_heap(
+    tilde: &[u8],
+    strings: &[u8],
+    name_pos: usize,
+    string_idx_size: usize,
+) -> Option<String> {
     if name_pos + string_idx_size > tilde.len() {
         return None;
     }
