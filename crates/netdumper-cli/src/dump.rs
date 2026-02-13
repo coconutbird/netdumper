@@ -11,7 +11,7 @@ use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 
 use crate::pe::{
     build_pe_from_metadata, build_pe_with_reconstructed_headers, convert_memory_to_file_layout,
-    extract_assembly_name_from_metadata, extract_assembly_name_from_metadata_debug,
+    extract_assembly_name_from_metadata_debug, extract_metadata_info, extract_method_rvas,
     is_pe_header_corrupted, read_pe_info, reconstruct_pe_info, validate_cli_header_in_memory,
 };
 use crate::process::enumerate_assemblies_external;
@@ -174,6 +174,23 @@ pub fn dump_assembly(
                 success: false,
                 error: Some("Metadata does not have BSJB signature".into()),
             };
+        }
+
+        // Extract metadata info for logging
+        let (entry_point, _flags) = extract_metadata_info(&metadata);
+        let method_rvas = extract_method_rvas(&metadata);
+        let methods_with_il = method_rvas.iter().filter(|m| m.rva != 0).count();
+
+        if entry_point != 0 {
+            eprintln!(
+                "  [INFO] {} - Reconstructing from metadata: entry point 0x{:08X}, {} methods with IL",
+                fallback_name, entry_point, methods_with_il
+            );
+        } else {
+            eprintln!(
+                "  [INFO] {} - Reconstructing from metadata: no entry point, {} methods with IL",
+                fallback_name, methods_with_il
+            );
         }
 
         // Build PE from raw metadata

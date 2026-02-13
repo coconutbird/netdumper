@@ -283,6 +283,432 @@ pub fn validate_cli_header_in_memory(
     true
 }
 
+/// Extract entry point token and flags from raw metadata.
+/// Returns (entry_point_token, flags) where:
+/// - entry_point_token is the MethodDef token for Main() if found, or 0
+/// - flags are the COR20 flags to use
+pub fn extract_metadata_info(metadata: &[u8]) -> (u32, u32) {
+    // Default: IL-only, no entry point
+    let flags: u32 = 0x00000001; // COMIMAGE_FLAGS_ILONLY
+    let mut entry_point: u32 = 0;
+
+    // Parse metadata to find entry point
+    // We look for a method named "Main" in the MethodDef table
+    if let Some(ep) = find_entry_point_in_metadata(metadata) {
+        entry_point = ep;
+    }
+
+    // Check if this is a 32-bit preferred assembly by looking at Assembly flags
+    // For now, we just use IL-only
+    (entry_point, flags)
+}
+
+/// Find the entry point method token in metadata.
+/// Looks for a static method named "Main" or "<Main>$" (top-level statements).
+fn find_entry_point_in_metadata(metadata: &[u8]) -> Option<u32> {
+    // Check BSJB signature
+    if metadata.len() < 16 || &metadata[0..4] != b"BSJB" {
+        return None;
+    }
+
+    // Parse metadata header
+    let version_length = u32::from_le_bytes([
+        metadata[12], metadata[13], metadata[14], metadata[15],
+    ]) as usize;
+    let version_padded = (version_length + 3) & !3;
+    let streams_offset = 16 + version_padded;
+
+    if streams_offset + 4 > metadata.len() {
+        return None;
+    }
+
+    let num_streams = u16::from_le_bytes([
+        metadata[streams_offset + 2], metadata[streams_offset + 3],
+    ]) as usize;
+
+    // Find #Strings and #~ streams
+    let mut strings_offset = 0usize;
+    let mut strings_size = 0usize;
+    let mut tilde_offset = 0usize;
+    let mut tilde_size = 0usize;
+
+    let mut pos = streams_offset + 4;
+    for _ in 0..num_streams {
+        if pos + 8 > metadata.len() {
+            break;
+        }
+
+        let stream_offset = u32::from_le_bytes([
+            metadata[pos], metadata[pos + 1], metadata[pos + 2], metadata[pos + 3],
+        ]) as usize;
+        let stream_size = u32::from_le_bytes([
+            metadata[pos + 4], metadata[pos + 5], metadata[pos + 6], metadata[pos + 7],
+        ]) as usize;
+
+        pos += 8;
+
+        let name_start = pos;
+        while pos < metadata.len() && metadata[pos] != 0 {
+            pos += 1;
+        }
+        let name = std::str::from_utf8(&metadata[name_start..pos]).unwrap_or("");
+        pos += 1;
+        pos = (pos + 3) & !3;
+
+        match name {
+            "#Strings" => {
+                strings_offset = stream_offset;
+                strings_size = stream_size;
+            }
+            "#~" | "#-" => {
+                tilde_offset = stream_offset;
+                tilde_size = stream_size;
+            }
+            _ => {}
+        }
+    }
+
+    if strings_offset == 0 || tilde_offset == 0 {
+        return None;
+    }
+
+    let tilde = metadata.get(tilde_offset..tilde_offset + tilde_size)?;
+    let strings = metadata.get(strings_offset..strings_offset + strings_size)?;
+
+    find_main_method_token(tilde, strings)
+}
+
+/// Find the MethodDef token for Main method.
+fn find_main_method_token(tilde: &[u8], strings: &[u8]) -> Option<u32> {
+    if tilde.len() < 24 {
+        return None;
+    }
+
+    let heap_sizes = tilde[6];
+    let string_idx_size = if heap_sizes & 0x01 != 0 { 4 } else { 2 };
+    let guid_idx_size = if heap_sizes & 0x02 != 0 { 4 } else { 2 };
+    let blob_idx_size = if heap_sizes & 0x04 != 0 { 4 } else { 2 };
+
+    let valid = u64::from_le_bytes([
+        tilde[8], tilde[9], tilde[10], tilde[11], tilde[12], tilde[13], tilde[14], tilde[15],
+    ]);
+
+    // MethodDef table is table 0x06
+    let methoddef_bit = 1u64 << 0x06;
+    if valid & methoddef_bit == 0 {
+        return None;
+    }
+
+    // Read row counts
+    let mut pos = 24usize;
+    let mut row_counts: Vec<u32> = Vec::new();
+
+    for i in 0..64 {
+        if valid & (1u64 << i) != 0 {
+            if pos + 4 > tilde.len() {
+                return None;
+            }
+            let count = u32::from_le_bytes([tilde[pos], tilde[pos + 1], tilde[pos + 2], tilde[pos + 3]]);
+            row_counts.push(count);
+            pos += 4;
+        }
+    }
+
+    // Calculate offset to MethodDef table
+    let tables_start = pos;
+    let mut methoddef_offset = 0usize;
+    let mut current_offset = tables_start;
+
+    for i in 0..64 {
+        if valid & (1u64 << i) != 0 {
+            if i == 0x06 {
+                methoddef_offset = current_offset;
+                break;
+            }
+            let row_size = get_table_row_size(i, &row_counts, valid, string_idx_size, guid_idx_size, blob_idx_size);
+            let table_index = count_bits_before(valid, i);
+            let row_count = *row_counts.get(table_index)? as usize;
+            current_offset += row_size * row_count;
+        }
+    }
+
+    if methoddef_offset == 0 {
+        return None;
+    }
+
+    // Get MethodDef row count
+    let methoddef_table_index = count_bits_before(valid, 0x06);
+    let methoddef_count = *row_counts.get(methoddef_table_index)? as usize;
+
+    // MethodDef row format (ECMA-335 II.22.26):
+    // RVA: u32
+    // ImplFlags: u16
+    // Flags: u16
+    // Name: String index
+    // Signature: Blob index
+    // ParamList: Param index
+
+    // Calculate ParamList index size
+    let param_idx_size = simple_idx_size(&row_counts, valid, 0x08); // Param table
+
+    let methoddef_row_size = 4 + 2 + 2 + string_idx_size + blob_idx_size + param_idx_size;
+    let name_offset_in_row = 4 + 2 + 2; // After RVA, ImplFlags, Flags
+
+    // Search for "Main" or "<Main>$" method
+    for row in 0..methoddef_count {
+        let row_offset = methoddef_offset + row * methoddef_row_size;
+        let name_pos = row_offset + name_offset_in_row;
+
+        if name_pos + string_idx_size > tilde.len() {
+            continue;
+        }
+
+        let name_index = if string_idx_size == 4 {
+            u32::from_le_bytes([
+                tilde[name_pos], tilde[name_pos + 1], tilde[name_pos + 2], tilde[name_pos + 3],
+            ]) as usize
+        } else {
+            u16::from_le_bytes([tilde[name_pos], tilde[name_pos + 1]]) as usize
+        };
+
+        if name_index >= strings.len() {
+            continue;
+        }
+
+        // Read null-terminated string
+        let mut end = name_index;
+        while end < strings.len() && strings[end] != 0 {
+            end += 1;
+        }
+        let name = std::str::from_utf8(&strings[name_index..end]).unwrap_or("");
+
+        // Check for Main or <Main>$ (top-level statements)
+        if name == "Main" || name == "<Main>$" {
+            // MethodDef token = 0x06000000 | (row + 1)
+            return Some(0x06000000 | ((row + 1) as u32));
+        }
+    }
+
+    None
+}
+
+/// Information about a method's IL from metadata.
+#[derive(Debug, Clone)]
+pub struct MethodRvaInfo {
+    /// MethodDef token (0x06xxxxxx).
+    pub token: u32,
+    /// RVA of the method body.
+    pub rva: u32,
+    /// Method name (if extracted).
+    pub name: Option<String>,
+}
+
+/// Extract all method RVAs from metadata.
+/// Returns a list of (token, rva) for methods with RVA != 0.
+/// These RVAs can be used with GetILForModule to retrieve IL code addresses.
+pub fn extract_method_rvas(metadata: &[u8]) -> Vec<MethodRvaInfo> {
+    let mut methods = Vec::new();
+
+    // Check BSJB signature
+    if metadata.len() < 16 || &metadata[0..4] != b"BSJB" {
+        return methods;
+    }
+
+    // Parse metadata header
+    let version_length = u32::from_le_bytes([
+        metadata[12], metadata[13], metadata[14], metadata[15],
+    ]) as usize;
+    let version_padded = (version_length + 3) & !3;
+    let streams_offset = 16 + version_padded;
+
+    if streams_offset + 4 > metadata.len() {
+        return methods;
+    }
+
+    let num_streams = u16::from_le_bytes([
+        metadata[streams_offset + 2], metadata[streams_offset + 3],
+    ]) as usize;
+
+    // Find #Strings and #~ streams
+    let mut strings_offset = 0usize;
+    let mut strings_size = 0usize;
+    let mut tilde_offset = 0usize;
+    let mut tilde_size = 0usize;
+
+    let mut pos = streams_offset + 4;
+    for _ in 0..num_streams {
+        if pos + 8 > metadata.len() {
+            break;
+        }
+
+        let stream_offset = u32::from_le_bytes([
+            metadata[pos], metadata[pos + 1], metadata[pos + 2], metadata[pos + 3],
+        ]) as usize;
+        let stream_size = u32::from_le_bytes([
+            metadata[pos + 4], metadata[pos + 5], metadata[pos + 6], metadata[pos + 7],
+        ]) as usize;
+
+        pos += 8;
+
+        let name_start = pos;
+        while pos < metadata.len() && metadata[pos] != 0 {
+            pos += 1;
+        }
+        let name = std::str::from_utf8(&metadata[name_start..pos]).unwrap_or("");
+        pos += 1;
+        pos = (pos + 3) & !3;
+
+        match name {
+            "#Strings" => {
+                strings_offset = stream_offset;
+                strings_size = stream_size;
+            }
+            "#~" | "#-" => {
+                tilde_offset = stream_offset;
+                tilde_size = stream_size;
+            }
+            _ => {}
+        }
+    }
+
+    if tilde_offset == 0 {
+        return methods;
+    }
+
+    let Some(tilde) = metadata.get(tilde_offset..tilde_offset + tilde_size) else {
+        return methods;
+    };
+    let strings = metadata.get(strings_offset..strings_offset + strings_size);
+
+    if tilde.len() < 24 {
+        return methods;
+    }
+
+    let heap_sizes = tilde[6];
+    let string_idx_size = if heap_sizes & 0x01 != 0 { 4 } else { 2 };
+    let guid_idx_size = if heap_sizes & 0x02 != 0 { 4 } else { 2 };
+    let blob_idx_size = if heap_sizes & 0x04 != 0 { 4 } else { 2 };
+
+    let valid = u64::from_le_bytes([
+        tilde[8], tilde[9], tilde[10], tilde[11], tilde[12], tilde[13], tilde[14], tilde[15],
+    ]);
+
+    // MethodDef table is table 0x06
+    let methoddef_bit = 1u64 << 0x06;
+    if valid & methoddef_bit == 0 {
+        return methods;
+    }
+
+    // Read row counts
+    let mut pos = 24usize;
+    let mut row_counts: Vec<u32> = Vec::new();
+
+    for i in 0..64 {
+        if valid & (1u64 << i) != 0 {
+            if pos + 4 > tilde.len() {
+                return methods;
+            }
+            let count = u32::from_le_bytes([tilde[pos], tilde[pos + 1], tilde[pos + 2], tilde[pos + 3]]);
+            row_counts.push(count);
+            pos += 4;
+        }
+    }
+
+    // Calculate offset to MethodDef table
+    let tables_start = pos;
+    let mut methoddef_offset = 0usize;
+    let mut current_offset = tables_start;
+
+    for i in 0..64 {
+        if valid & (1u64 << i) != 0 {
+            if i == 0x06 {
+                methoddef_offset = current_offset;
+                break;
+            }
+            let row_size = get_table_row_size(i, &row_counts, valid, string_idx_size, guid_idx_size, blob_idx_size);
+            let table_index = count_bits_before(valid, i);
+            let Some(&row_count) = row_counts.get(table_index) else {
+                return methods;
+            };
+            current_offset += row_size * row_count as usize;
+        }
+    }
+
+    if methoddef_offset == 0 {
+        return methods;
+    }
+
+    // Get MethodDef row count
+    let methoddef_table_index = count_bits_before(valid, 0x06);
+    let Some(&methoddef_count) = row_counts.get(methoddef_table_index) else {
+        return methods;
+    };
+
+    // MethodDef row format (ECMA-335 II.22.26):
+    // RVA: u32
+    // ImplFlags: u16
+    // Flags: u16
+    // Name: String index
+    // Signature: Blob index
+    // ParamList: Param index
+    let param_idx_size = simple_idx_size(&row_counts, valid, 0x08);
+    let methoddef_row_size = 4 + 2 + 2 + string_idx_size + blob_idx_size + param_idx_size;
+
+    for row in 0..methoddef_count as usize {
+        let row_offset = methoddef_offset + row * methoddef_row_size;
+
+        if row_offset + 4 > tilde.len() {
+            break;
+        }
+
+        // Read RVA (first 4 bytes)
+        let rva = u32::from_le_bytes([
+            tilde[row_offset], tilde[row_offset + 1], tilde[row_offset + 2], tilde[row_offset + 3],
+        ]);
+
+        // Skip methods with RVA 0 (abstract/extern methods)
+        if rva == 0 {
+            continue;
+        }
+
+        let token = 0x06000000 | ((row + 1) as u32);
+
+        // Optionally read method name
+        let name = if let Some(strings) = strings {
+            let name_pos = row_offset + 4 + 2 + 2; // After RVA, ImplFlags, Flags
+            if name_pos + string_idx_size <= tilde.len() {
+                let name_index = if string_idx_size == 4 {
+                    u32::from_le_bytes([
+                        tilde[name_pos], tilde[name_pos + 1], tilde[name_pos + 2], tilde[name_pos + 3],
+                    ]) as usize
+                } else {
+                    u16::from_le_bytes([tilde[name_pos], tilde[name_pos + 1]]) as usize
+                };
+
+                if name_index < strings.len() {
+                    let mut end = name_index;
+                    while end < strings.len() && strings[end] != 0 {
+                        end += 1;
+                    }
+                    std::str::from_utf8(&strings[name_index..end])
+                        .ok()
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        methods.push(MethodRvaInfo { token, rva, name });
+    }
+
+    methods
+}
+
 /// Build a minimal PE from raw metadata bytes.
 /// This is used when ilBase doesn't point to a valid PE but we have metadata from DAC.
 ///
@@ -298,6 +724,8 @@ pub fn validate_cli_header_in_memory(
 /// 0x200: COR20 Header (72 bytes)
 /// 0x248: Metadata
 pub fn build_pe_from_metadata(metadata: &[u8], is_64bit: bool) -> Vec<u8> {
+    // Extract entry point and flags from metadata
+    let (entry_point_token, cor_flags) = extract_metadata_info(metadata);
     const FILE_ALIGNMENT: u32 = 0x200;
     const SECTION_ALIGNMENT: u32 = 0x1000;
     const SIZE_OF_HEADERS: u32 = 0x200;
@@ -456,9 +884,10 @@ pub fn build_pe_from_metadata(metadata: &[u8], is_64bit: bool) -> Vec<u8> {
     pe[cor20_offset + 8..cor20_offset + 12].copy_from_slice(&METADATA_RVA.to_le_bytes());
     // MetaData Size
     pe[cor20_offset + 12..cor20_offset + 16].copy_from_slice(&metadata_size.to_le_bytes());
-    // Flags = COMIMAGE_FLAGS_ILONLY
-    pe[cor20_offset + 16..cor20_offset + 20].copy_from_slice(&1u32.to_le_bytes());
-    // EntryPointToken = 0 (no entry point for class library)
+    // Flags (extracted from metadata analysis)
+    pe[cor20_offset + 16..cor20_offset + 20].copy_from_slice(&cor_flags.to_le_bytes());
+    // EntryPointToken (MethodDef token for Main if found)
+    pe[cor20_offset + 20..cor20_offset + 24].copy_from_slice(&entry_point_token.to_le_bytes());
     // Rest of COR20 header fields are 0 (no resources, strong name, etc.)
 
     // Copy metadata after COR20 header

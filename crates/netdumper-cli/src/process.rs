@@ -474,6 +474,7 @@ unsafe fn get_assembly_info(
                 info.is_pe_file = module_data.bIsPEFile != 0;
                 info.metadata_address = module_data.metadataStart as usize;
                 info.metadata_size = module_data.metadataSize as usize;
+                info.module_address = module_addr as usize;
                 return Some(info);
             }
         }

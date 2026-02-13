@@ -23,6 +23,8 @@ pub struct AssemblyInfo {
     pub metadata_address: usize,
     /// Size of metadata.
     pub metadata_size: usize,
+    /// DAC module address (for GetILForModule calls).
+    pub module_address: usize,
 }
 
 impl AssemblyInfo {
@@ -38,6 +40,20 @@ impl AssemblyInfo {
             is_pe_file: true,
             metadata_address: 0,
             metadata_size: 0,
+            module_address: 0,
         }
     }
+}
+
+/// Information about a method's IL body.
+#[derive(Debug, Clone)]
+pub struct MethodILInfo {
+    /// MethodDef token (0x06xxxxxx).
+    pub token: u32,
+    /// RVA of the method body in metadata.
+    pub rva: u32,
+    /// Address of IL code in process memory (from GetILForModule).
+    pub il_address: usize,
+    /// Size of the IL method body (including header).
+    pub il_size: usize,
 }
