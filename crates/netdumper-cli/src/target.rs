@@ -18,19 +18,13 @@ use windows::Win32::System::ProcessStatus::{
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 use windows::core::{GUID, HRESULT};
 
-use crate::runtime::{exe_has_clr_exports, get_embedded_clr_version_with_handle, EmbeddedRuntimeInfo};
+use crate::runtime::{
+    EmbeddedRuntimeInfo, exe_has_clr_exports, get_embedded_clr_version_with_handle,
+};
 use crate::{Error, Result};
 
 /// Type alias for CLR data addresses
 pub type ClrDataAddress = u64;
-
-// Machine type constant for current architecture
-#[cfg(target_arch = "x86_64")]
-const IMAGE_FILE_MACHINE_CURRENT: u16 = 0x8664; // AMD64
-#[cfg(target_arch = "x86")]
-const IMAGE_FILE_MACHINE_CURRENT: u16 = 0x014c; // I386
-#[cfg(target_arch = "aarch64")]
-const IMAGE_FILE_MACHINE_CURRENT: u16 = 0xAA64; // ARM64
 
 // GUID for ICLRDataTarget interface
 const IID_ICLR_DATA_TARGET: GUID = GUID::from_u128(0x3E11CCEE_D08B_43E5_AF01_32717A64DA03);
@@ -143,6 +137,8 @@ pub struct ProcessInfo {
     /// Path to the main executable (currently unused, reserved for future use)
     #[allow(dead_code)]
     pub(crate) exe_path: Option<PathBuf>,
+    /// Target process machine type (from PE header)
+    pub(crate) machine_type: u16,
     /// Whether this process has an embedded CLR (single-file deployment)
     pub(crate) is_embedded_clr: bool,
     /// Cached embedded CLR info (if applicable)
@@ -183,6 +179,14 @@ impl ProcessInfo {
 
         let exe_base_address = if count > 0 { modules[0].0 as u64 } else { 0 };
 
+        // Read machine type from main module's PE header
+        let machine_type = if exe_base_address != 0 {
+            read_machine_type_from_process(handle.as_raw(), exe_base_address as usize)
+                .unwrap_or(default_machine_type())
+        } else {
+            default_machine_type()
+        };
+
         let exe_path = if count > 0 {
             let mut path_buf = [0u16; 512];
             let path_len = unsafe {
@@ -214,10 +218,92 @@ impl ProcessInfo {
             module_bases,
             exe_base_address,
             exe_path,
+            machine_type,
             is_embedded_clr,
             embedded_clr_info,
         })
     }
+}
+
+/// Read the machine type from a PE header in a remote process.
+fn read_machine_type_from_process(handle: HANDLE, base_address: usize) -> Option<u16> {
+    // Read DOS header to get e_lfanew
+    let mut dos_header = [0u8; 64];
+    let mut bytes_read = 0usize;
+
+    if unsafe {
+        ReadProcessMemory(
+            handle,
+            base_address as *const c_void,
+            dos_header.as_mut_ptr() as *mut c_void,
+            dos_header.len(),
+            Some(&mut bytes_read),
+        )
+    }
+    .is_err()
+        || bytes_read < 64
+    {
+        return None;
+    }
+
+    // Check DOS signature (MZ)
+    if dos_header[0] != b'M' || dos_header[1] != b'Z' {
+        return None;
+    }
+
+    // Get PE header offset
+    let e_lfanew = u32::from_le_bytes([
+        dos_header[0x3C],
+        dos_header[0x3D],
+        dos_header[0x3E],
+        dos_header[0x3F],
+    ]) as usize;
+
+    if !(64..=1024).contains(&e_lfanew) {
+        return None;
+    }
+
+    // Read PE signature + COFF header (at least 8 bytes for PE sig + machine type)
+    let mut pe_header = [0u8; 8];
+    if unsafe {
+        ReadProcessMemory(
+            handle,
+            (base_address + e_lfanew) as *const c_void,
+            pe_header.as_mut_ptr() as *mut c_void,
+            pe_header.len(),
+            Some(&mut bytes_read),
+        )
+    }
+    .is_err()
+        || bytes_read < 8
+    {
+        return None;
+    }
+
+    // Check PE signature
+    if pe_header[0] != b'P' || pe_header[1] != b'E' || pe_header[2] != 0 || pe_header[3] != 0 {
+        return None;
+    }
+
+    // Machine type is at offset 4-5 in COFF header (after PE signature)
+    let machine_type = u16::from_le_bytes([pe_header[4], pe_header[5]]);
+    Some(machine_type)
+}
+
+/// Get the default machine type for the current build architecture.
+#[cfg(target_arch = "x86_64")]
+fn default_machine_type() -> u16 {
+    0x8664 // AMD64
+}
+
+#[cfg(target_arch = "x86")]
+fn default_machine_type() -> u16 {
+    0x014c // I386
+}
+
+#[cfg(target_arch = "aarch64")]
+fn default_machine_type() -> u16 {
+    0xAA64 // ARM64
 }
 
 // =============================================================================
@@ -233,6 +319,7 @@ pub struct CLRDataTarget {
     owns_handle: bool,
     module_bases: HashMap<String, u64>,
     exe_base_address: u64,
+    machine_type: u16,
     is_embedded_clr: bool,
 }
 
@@ -265,6 +352,7 @@ impl CLRDataTarget {
         let handle = info.handle.0;
         let module_bases = info.module_bases;
         let exe_base_address = info.exe_base_address;
+        let machine_type = info.machine_type;
         let is_embedded_clr = info.is_embedded_clr;
 
         std::mem::forget(info.handle);
@@ -276,6 +364,7 @@ impl CLRDataTarget {
             owns_handle: true,
             module_bases,
             exe_base_address,
+            machine_type,
             is_embedded_clr,
         });
 
@@ -324,24 +413,31 @@ unsafe extern "system" fn clr_release(this: *mut ICLRDataTargetImpl) -> u32 {
 }
 
 unsafe extern "system" fn clr_get_machine_type(
-    _this: *mut ICLRDataTargetImpl,
+    this: *mut ICLRDataTargetImpl,
     machine_type: *mut u32,
 ) -> HRESULT {
     if machine_type.is_null() {
         return E_FAIL;
     }
-    unsafe { *machine_type = IMAGE_FILE_MACHINE_CURRENT as u32 };
+    let target = unsafe { &*(this as *const CLRDataTarget) };
+    unsafe { *machine_type = target.machine_type as u32 };
     S_OK
 }
 
 unsafe extern "system" fn clr_get_pointer_size(
-    _this: *mut ICLRDataTargetImpl,
+    this: *mut ICLRDataTargetImpl,
     pointer_size: *mut u32,
 ) -> HRESULT {
     if pointer_size.is_null() {
         return E_FAIL;
     }
-    unsafe { *pointer_size = std::mem::size_of::<*const c_void>() as u32 };
+    let target = unsafe { &*(this as *const CLRDataTarget) };
+    // Determine pointer size based on target machine type
+    let size = match target.machine_type {
+        0x8664 | 0xAA64 => 8, // AMD64 or ARM64 = 64-bit
+        _ => 4,               // Everything else (I386, etc) = 32-bit
+    };
+    unsafe { *pointer_size = size };
     S_OK
 }
 
@@ -376,11 +472,13 @@ unsafe extern "system" fn clr_get_image_base(
         return S_OK;
     }
 
-    if target.is_embedded_clr && target.exe_base_address != 0
-        && (filename == "coreclr.dll" || filename == "clr.dll") {
-            unsafe { *base_address = target.exe_base_address };
-            return S_OK;
-        }
+    if target.is_embedded_clr
+        && target.exe_base_address != 0
+        && (filename == "coreclr.dll" || filename == "clr.dll")
+    {
+        unsafe { *base_address = target.exe_base_address };
+        return S_OK;
+    }
 
     E_FAIL
 }
@@ -485,4 +583,3 @@ unsafe extern "system" fn clr_request(
 ) -> HRESULT {
     E_NOTIMPL
 }
-

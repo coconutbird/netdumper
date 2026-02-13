@@ -15,8 +15,8 @@ pub use mscoree::{
 };
 
 use crate::runtime::{
-    find_all_system_dotnet_runtimes, find_best_matching_dac, find_runtime_directory_by_pid,
-    DacModuleIndex,
+    DacModuleIndex, find_all_system_dotnet_runtimes, find_best_matching_dac,
+    find_runtime_directory_by_pid,
 };
 use crate::target::{CLRDataTarget, ICLRDataTargetImpl, ProcessInfo};
 use crate::{AssemblyInfo, Error, Result};
@@ -211,9 +211,8 @@ fn download_dac_from_symbol_server(dac_index: &DacModuleIndex) -> Result<PathBuf
 fn enumerate_with_multiple_dacs(process_info: ProcessInfo) -> Result<Vec<AssemblyInfo>> {
     let embedded_info = process_info.embedded_clr_info;
 
-    let pid = unsafe {
-        windows::Win32::System::Threading::GetProcessId(process_info.handle.as_raw())
-    };
+    let pid =
+        unsafe { windows::Win32::System::Threading::GetProcessId(process_info.handle.as_raw()) };
 
     if let Some(ref info) = embedded_info {
         eprintln!(
@@ -270,29 +269,30 @@ fn enumerate_with_multiple_dacs(process_info: ProcessInfo) -> Result<Vec<Assembl
 
     // Try downloading from symbol server
     if let Some(ref info) = embedded_info
-        && let Some(dac_index) = info.dac_index() {
-            eprintln!("No local DAC matched. Attempting download from Microsoft Symbol Server...");
+        && let Some(dac_index) = info.dac_index()
+    {
+        eprintln!("No local DAC matched. Attempting download from Microsoft Symbol Server...");
 
-            match download_dac_from_symbol_server(&dac_index) {
-                Ok(dac_path) => {
-                    eprintln!("Downloaded DAC, attempting to use: {}", dac_path.display());
-                    match try_enumerate_with_dac_path_by_pid(pid, &dac_path) {
-                        Ok(assemblies) => {
-                            eprintln!("Success with downloaded DAC!");
-                            return Ok(assemblies);
-                        }
-                        Err(e) => {
-                            last_error = format!("Downloaded DAC failed: {}", e);
-                            eprintln!("{}", last_error);
-                        }
+        match download_dac_from_symbol_server(&dac_index) {
+            Ok(dac_path) => {
+                eprintln!("Downloaded DAC, attempting to use: {}", dac_path.display());
+                match try_enumerate_with_dac_path_by_pid(pid, &dac_path) {
+                    Ok(assemblies) => {
+                        eprintln!("Success with downloaded DAC!");
+                        return Ok(assemblies);
+                    }
+                    Err(e) => {
+                        last_error = format!("Downloaded DAC failed: {}", e);
+                        eprintln!("{}", last_error);
                     }
                 }
-                Err(e) => {
-                    last_error = format!("DAC download failed: {}", e);
-                    eprintln!("{}", last_error);
-                }
+            }
+            Err(e) => {
+                last_error = format!("DAC download failed: {}", e);
+                eprintln!("{}", last_error);
             }
         }
+    }
 
     if dac_paths.is_empty() && embedded_info.is_none() {
         return Err(Error::Other("No .NET Core runtimes found on system".into()));

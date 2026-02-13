@@ -250,27 +250,29 @@ pub fn find_runtime_directory(handle: HANDLE) -> Result<Option<RuntimeInfo>> {
 
     // Check for embedded CLR
     if let Some(exe_path) = main_exe_path
-        && exe_has_clr_exports(&exe_path) {
-            if let Some(embedded_info) = get_embedded_clr_version_with_handle(handle)
-                && let Some(dac_path) = find_best_matching_dac(
-                    embedded_info.major(),
-                    embedded_info.minor(),
-                    embedded_info.build(),
-                )
-                    && let Some(runtime_dir) = dac_path.parent() {
-                        return Ok(Some(RuntimeInfo {
-                            directory: runtime_dir.to_path_buf(),
-                            runtime_type: RuntimeType::Core,
-                        }));
-                    }
-
-            if let Some(runtime_dir) = find_system_dotnet_runtime() {
-                return Ok(Some(RuntimeInfo {
-                    directory: runtime_dir,
-                    runtime_type: RuntimeType::Core,
-                }));
-            }
+        && exe_has_clr_exports(&exe_path)
+    {
+        if let Some(embedded_info) = get_embedded_clr_version_with_handle(handle)
+            && let Some(dac_path) = find_best_matching_dac(
+                embedded_info.major(),
+                embedded_info.minor(),
+                embedded_info.build(),
+            )
+            && let Some(runtime_dir) = dac_path.parent()
+        {
+            return Ok(Some(RuntimeInfo {
+                directory: runtime_dir.to_path_buf(),
+                runtime_type: RuntimeType::Core,
+            }));
         }
+
+        if let Some(runtime_dir) = find_system_dotnet_runtime() {
+            return Ok(Some(RuntimeInfo {
+                directory: runtime_dir,
+                runtime_type: RuntimeType::Core,
+            }));
+        }
+    }
 
     Ok(None)
 }
@@ -375,12 +377,13 @@ pub fn find_best_matching_dac(major: i32, minor: i32, build: i32) -> Option<Path
     let target_version = format!("{}.{}.{}", major, minor, build);
     for runtime_dir in &all_runtimes {
         if let Some(version) = runtime_dir.file_name().and_then(|s| s.to_str())
-            && version == target_version {
-                let dac_path = runtime_dir.join("mscordaccore.dll");
-                if dac_path.exists() {
-                    return Some(dac_path);
-                }
+            && version == target_version
+        {
+            let dac_path = runtime_dir.join("mscordaccore.dll");
+            if dac_path.exists() {
+                return Some(dac_path);
             }
+        }
     }
 
     for runtime_dir in &all_runtimes {
@@ -434,8 +437,16 @@ pub fn diagnose_process(pid: u32) -> Result<DiagnosticInfo> {
     let mut exe_path: Option<PathBuf> = None;
 
     let dotnet_patterns = [
-        "coreclr", "clr.dll", "mscor", "clrjit", "hostfxr",
-        "hostpolicy", "system.private", "microsoft.netcore", ".net\\", "/.net/",
+        "coreclr",
+        "clr.dll",
+        "mscor",
+        "clrjit",
+        "hostfxr",
+        "hostpolicy",
+        "system.private",
+        "microsoft.netcore",
+        ".net\\",
+        "/.net/",
     ];
 
     for i in 0..count {
@@ -821,4 +832,3 @@ pub fn get_embedded_clr_version_with_handle(handle: HANDLE) -> Option<EmbeddedRu
 
     None
 }
-

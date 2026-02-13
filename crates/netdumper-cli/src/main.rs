@@ -179,16 +179,16 @@ fn main() {
 
                     // Show embedded CLR info if available
                     if let Ok(ref diag) = diag_result
-                        && diag.has_embedded_clr {
-                            println!("\n  Embedded CLR: Yes (single-file deployment)");
-                            if let Some((major, minor, build, revision)) = diag.embedded_clr_version
-                            {
-                                println!(
-                                    "  Embedded CLR version: {}.{}.{}.{}",
-                                    major, minor, build, revision
-                                );
-                            }
+                        && diag.has_embedded_clr
+                    {
+                        println!("\n  Embedded CLR: Yes (single-file deployment)");
+                        if let Some((major, minor, build, revision)) = diag.embedded_clr_version {
+                            println!(
+                                "  Embedded CLR version: {}.{}.{}.{}",
+                                major, minor, build, revision
+                            );
                         }
+                    }
                 }
                 Ok(None) => {
                     println!("✗ No .NET runtime detected via standard method\n");

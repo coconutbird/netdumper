@@ -10,14 +10,6 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQueryEx};
 
-// Machine type constant for current architecture
-#[cfg(target_arch = "x86_64")]
-const IMAGE_FILE_MACHINE_CURRENT: u16 = 0x8664;
-#[cfg(target_arch = "x86")]
-const IMAGE_FILE_MACHINE_CURRENT: u16 = 0x014c;
-#[cfg(target_arch = "aarch64")]
-const IMAGE_FILE_MACHINE_CURRENT: u16 = 0xAA64;
-
 // =============================================================================
 // Types
 // =============================================================================
@@ -35,6 +27,7 @@ pub struct SectionInfo {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct PeInfo {
+    pub machine_type: u16,
     pub e_lfanew: u32,
     pub size_of_image: u32,
     pub size_of_headers: u32,
@@ -113,6 +106,8 @@ pub fn read_pe_info(process_handle: HANDLE, base_address: usize) -> Option<PeInf
         return None;
     }
 
+    // Machine type is at offset 4-5 in COFF header (after PE signature)
+    let machine_type = u16::from_le_bytes([pe_header[4], pe_header[5]]);
     let number_of_sections = u16::from_le_bytes([pe_header[6], pe_header[7]]);
     let size_of_optional_header = u16::from_le_bytes([pe_header[20], pe_header[21]]);
 
@@ -182,6 +177,7 @@ pub fn read_pe_info(process_handle: HANDLE, base_address: usize) -> Option<PeInf
     }
 
     Some(PeInfo {
+        machine_type,
         e_lfanew,
         size_of_image,
         size_of_headers,
@@ -280,8 +276,13 @@ fn scan_memory_regions(
 // PE Reconstruction (Anti-Anti-Dump)
 // =============================================================================
 
-/// Reconstruct PE headers from memory regions when original headers are corrupted
-pub fn reconstruct_pe_info(process_handle: HANDLE, base_address: usize) -> Option<PeInfo> {
+/// Reconstruct PE headers from memory regions when original headers are corrupted.
+/// `machine_type` must be provided since we can't read it from corrupted headers.
+pub fn reconstruct_pe_info(
+    process_handle: HANDLE,
+    base_address: usize,
+    machine_type: u16,
+) -> Option<PeInfo> {
     let regions = scan_memory_regions(process_handle, base_address, 0x10000000);
 
     if regions.is_empty() {
@@ -330,18 +331,18 @@ pub fn reconstruct_pe_info(process_handle: HANDLE, base_address: usize) -> Optio
         });
     }
 
+    // Determine PE32+ based on machine type
+    let is_pe32_plus = machine_type == 0x8664 || machine_type == 0xAA64; // AMD64 or ARM64
+
     Some(PeInfo {
+        machine_type,
         e_lfanew: 0x80,
         size_of_image,
         size_of_headers: 0x1000,
         number_of_sections: sections.len() as u16,
-        size_of_optional_header: if cfg!(target_arch = "x86_64") {
-            0xF0
-        } else {
-            0xE0
-        },
+        size_of_optional_header: if is_pe32_plus { 0xF0 } else { 0xE0 },
         sections,
-        is_pe32_plus: cfg!(target_arch = "x86_64"),
+        is_pe32_plus,
     })
 }
 
@@ -434,9 +435,8 @@ pub fn build_pe_with_reconstructed_headers(memory_image: &[u8], pe_info: &PeInfo
 
     // COFF header (20 bytes) at 0x84
     let coff_offset = 0x84;
-    // Machine
-    file_image[coff_offset..coff_offset + 2]
-        .copy_from_slice(&IMAGE_FILE_MACHINE_CURRENT.to_le_bytes());
+    // Machine (from pe_info, detected from target process)
+    file_image[coff_offset..coff_offset + 2].copy_from_slice(&pe_info.machine_type.to_le_bytes());
     // NumberOfSections
     file_image[coff_offset + 2..coff_offset + 4]
         .copy_from_slice(&pe_info.number_of_sections.to_le_bytes());

@@ -6,15 +6,15 @@
 use std::ffi::c_void;
 use std::path::PathBuf;
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 
 use crate::pe::{
     build_pe_with_reconstructed_headers, convert_memory_to_file_layout, is_pe_header_corrupted,
     read_pe_info, reconstruct_pe_info,
 };
 use crate::process::enumerate_assemblies_external;
+use crate::target::ProcessInfo;
 use crate::{AssemblyInfo, Error, Result};
 
 // =============================================================================
@@ -47,16 +47,18 @@ pub fn dump_assemblies_external(pid: u32, output_dir: &std::path::Path) -> Resul
 
     let assemblies = enumerate_assemblies_external(pid)?;
 
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }
-        .map_err(|e| Error::Other(format!("Failed to open process: {}", e)))?;
+    // Get process info to read machine type
+    let process_info = ProcessInfo::new(pid)?;
+    let handle = process_info.handle.as_raw();
+    let machine_type = process_info.machine_type;
 
     let mut results = Vec::with_capacity(assemblies.len());
     for assembly in &assemblies {
-        let result = dump_assembly(handle, assembly, output_dir);
+        let result = dump_assembly(handle, assembly, output_dir, machine_type);
         results.push(result);
     }
 
-    unsafe { CloseHandle(handle).ok() };
+    // Handle is automatically closed when process_info is dropped
 
     Ok(results)
 }
@@ -66,6 +68,7 @@ pub fn dump_assembly(
     process_handle: HANDLE,
     assembly: &AssemblyInfo,
     output_dir: &std::path::Path,
+    machine_type: u16,
 ) -> DumpResult {
     let safe_name = sanitize_filename(&assembly.name);
     let output_path = output_dir.join(format!("{}.dll", safe_name));
@@ -84,7 +87,7 @@ pub fn dump_assembly(
 
     let (pe_info, needs_reconstruction) = match pe_info_result {
         Some(info) => (info, false),
-        None => match reconstruct_pe_info(process_handle, assembly.base_address) {
+        None => match reconstruct_pe_info(process_handle, assembly.base_address, machine_type) {
             Some(info) => (info, true),
             None => {
                 return DumpResult {
@@ -125,7 +128,8 @@ pub fn dump_assembly(
         let reconstructed_info = if needs_reconstruction {
             pe_info
         } else {
-            reconstruct_pe_info(process_handle, assembly.base_address).unwrap_or(pe_info)
+            reconstruct_pe_info(process_handle, assembly.base_address, machine_type)
+                .unwrap_or(pe_info)
         };
         build_pe_with_reconstructed_headers(&buffer, &reconstructed_info)
     } else {
@@ -160,4 +164,3 @@ fn sanitize_filename(name: &str) -> String {
         })
         .collect()
 }
-
