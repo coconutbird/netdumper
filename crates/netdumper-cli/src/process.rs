@@ -71,12 +71,10 @@ fn load_dac_create_instance(dac_path: &Path) -> Result<CLRDataCreateInstanceFn> 
     let create_instance: CLRDataCreateInstanceFn = unsafe {
         let proc = GetProcAddress(dac_module, windows::core::s!("CLRDataCreateInstance"));
         match proc {
-            Some(p) => {
-                std::mem::transmute::<
-                    unsafe extern "system" fn() -> isize,
-                    CLRDataCreateInstanceFn,
-                >(p)
-            }
+            Some(p) => std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                CLRDataCreateInstanceFn,
+            >(p),
             None => return Err(Error::Other("CLRDataCreateInstance not found".into())),
         }
     };

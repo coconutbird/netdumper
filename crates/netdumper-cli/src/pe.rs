@@ -1841,11 +1841,7 @@ pub fn reconstruct_metadata_header(metadata: &[u8], streams: &MetadataStreamLoca
     let storage_header_size = 4;
 
     // Stream header sizes (offset:4 + size:4 + name aligned to 4)
-    let tilde_header_size = if streams.tilde_size > 0 {
-        12
-    } else {
-        0
-    }; // "#~\0\0" or "#-\0\0"
+    let tilde_header_size = if streams.tilde_size > 0 { 12 } else { 0 }; // "#~\0\0" or "#-\0\0"
     let strings_header_size = if streams.strings_size > 0 { 8 + 12 } else { 0 }; // "#Strings\0" padded
     let us_header_size = if streams.us_size > 0 { 8 + 4 } else { 0 }; // "#US\0"
     let guid_header_size = if streams.guid_size > 0 { 8 + 8 } else { 0 }; // "#GUID\0" padded
