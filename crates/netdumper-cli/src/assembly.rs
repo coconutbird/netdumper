@@ -97,6 +97,7 @@ impl AssemblyInfo {
 
 /// Information about a method's IL body.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MethodILInfo {
     /// MethodDef token (0x06xxxxxx).
     pub token: u32,

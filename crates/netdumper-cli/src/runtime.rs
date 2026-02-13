@@ -187,8 +187,7 @@ pub fn find_runtime_directory(handle: HANDLE) -> Result<Option<RuntimeInfo>> {
 
     let mut main_exe_path: Option<PathBuf> = None;
 
-    for i in 0..count {
-        let module = modules[i];
+    for (i, &module) in modules.iter().enumerate().take(count) {
         let mut name_buf = [0u16; 260];
         let len = unsafe { GetModuleBaseNameW(handle, Some(module), &mut name_buf) };
         if len > 0 {
@@ -225,8 +224,7 @@ pub fn find_runtime_directory(handle: HANDLE) -> Result<Option<RuntimeInfo>> {
     }
 
     // Check for single-file extraction path
-    for i in 0..count {
-        let module = modules[i];
+    for &module in modules.iter().take(count) {
         let mut path_buf = [0u16; 512];
         let path_len = unsafe { GetModuleFileNameExW(Some(handle), Some(module), &mut path_buf) };
         if path_len > 0 {
@@ -449,8 +447,7 @@ pub fn diagnose_process(pid: u32) -> Result<DiagnosticInfo> {
         "/.net/",
     ];
 
-    for i in 0..count {
-        let module = modules_arr[i];
+    for (i, &module) in modules_arr.iter().enumerate().take(count) {
         let mut path_buf = [0u16; 512];
         let path_len = unsafe { GetModuleFileNameExW(Some(handle), Some(module), &mut path_buf) };
 

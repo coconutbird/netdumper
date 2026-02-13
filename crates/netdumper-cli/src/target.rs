@@ -167,8 +167,7 @@ impl ProcessInfo {
         let count = needed as usize / std::mem::size_of::<windows::Win32::Foundation::HMODULE>();
 
         let mut module_bases = HashMap::new();
-        for i in 0..count {
-            let module = modules[i];
+        for &module in modules.iter().take(count) {
             let mut name_buf = [0u16; 260];
             let len = unsafe { GetModuleBaseNameW(handle.as_raw(), Some(module), &mut name_buf) };
             if len > 0 {

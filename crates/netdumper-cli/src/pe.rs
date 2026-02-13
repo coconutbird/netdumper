@@ -618,10 +618,12 @@ fn find_main_method_token(tilde: &[u8], strings: &[u8]) -> Option<u32> {
 #[derive(Debug, Clone)]
 pub struct MethodRvaInfo {
     /// MethodDef token (0x06xxxxxx).
+    #[allow(dead_code)]
     pub token: u32,
     /// RVA of the method body.
     pub rva: u32,
     /// Method name (if extracted).
+    #[allow(dead_code)]
     pub name: Option<String>,
 }
 
@@ -1076,7 +1078,7 @@ pub fn build_pe_from_metadata_with_il(
     let metadata_size = metadata.len() as u32;
 
     // Find the range of IL RVAs to determine PE layout
-    let min_il_rva = il_bodies.iter().map(|b| b.rva).min().unwrap_or(0);
+    let _min_il_rva = il_bodies.iter().map(|b| b.rva).min().unwrap_or(0);
     let max_il_end = il_bodies
         .iter()
         .map(|b| b.rva + b.data.len() as u32)
@@ -1840,7 +1842,7 @@ pub fn reconstruct_metadata_header(metadata: &[u8], streams: &MetadataStreamLoca
 
     // Stream header sizes (offset:4 + size:4 + name aligned to 4)
     let tilde_header_size = if streams.tilde_size > 0 {
-        8 + if streams.is_compressed { 4 } else { 4 }
+        12
     } else {
         0
     }; // "#~\0\0" or "#-\0\0"
@@ -2208,7 +2210,7 @@ pub fn repair_pe_metadata(pe_data: &[u8], good_metadata: &[u8]) -> Option<Vec<u8
 
         // Zero out remaining space if new metadata is smaller
         if good_metadata.len() < old_metadata_size {
-            let remaining = old_metadata_size - good_metadata.len();
+            let _remaining = old_metadata_size - good_metadata.len();
             let end = (metadata_offset + old_metadata_size).min(result.len());
             let start = metadata_offset + good_metadata.len();
             if start < end {
@@ -2235,6 +2237,7 @@ pub fn repair_pe_metadata(pe_data: &[u8], good_metadata: &[u8]) -> Option<Vec<u8
 
 /// Debug info for metadata extraction failures
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum MetadataError {
     TooSmall,
     NoDosSignature,
@@ -2595,8 +2598,8 @@ fn extract_assembly_name_from_tilde_stream(tilde: &[u8], strings: &[u8]) -> Opti
     let has_module_table = valid & module_table_bit != 0;
 
     // Try Assembly table first, then fall back to Module table
-    if has_assembly_table {
-        if let Some(name) = extract_name_from_assembly_table(
+    if has_assembly_table
+        && let Some(name) = extract_name_from_assembly_table(
             tilde,
             strings,
             &row_counts,
@@ -2605,18 +2608,17 @@ fn extract_assembly_name_from_tilde_stream(tilde: &[u8], strings: &[u8]) -> Opti
             string_idx_size,
             guid_idx_size,
             blob_idx_size,
-        ) {
-            return Some(name);
-        }
+        )
+    {
+        return Some(name);
     }
 
     // Fall back to Module table
-    if has_module_table {
-        if let Some(name) =
+    if has_module_table
+        && let Some(name) =
             extract_name_from_module_table(tilde, strings, tables_start, string_idx_size)
-        {
-            return Some(name);
-        }
+    {
+        return Some(name);
     }
 
     None
@@ -2888,7 +2890,12 @@ fn extract_full_assembly_metadata(
 
     // Read PublicKey blob index
     let public_key_index = if blob_idx_size == 4 {
-        let idx = u32::from_le_bytes([row[offset], row[offset + 1], row[offset + 2], row[offset + 3]]);
+        let idx = u32::from_le_bytes([
+            row[offset],
+            row[offset + 1],
+            row[offset + 2],
+            row[offset + 3],
+        ]);
         offset += 4;
         idx as usize
     } else {
@@ -2899,7 +2906,12 @@ fn extract_full_assembly_metadata(
 
     // Read Name string index
     let name_index = if string_idx_size == 4 {
-        let idx = u32::from_le_bytes([row[offset], row[offset + 1], row[offset + 2], row[offset + 3]]);
+        let idx = u32::from_le_bytes([
+            row[offset],
+            row[offset + 1],
+            row[offset + 2],
+            row[offset + 3],
+        ]);
         offset += 4;
         idx as usize
     } else {
@@ -2910,7 +2922,12 @@ fn extract_full_assembly_metadata(
 
     // Read Culture string index
     let culture_index = if string_idx_size == 4 {
-        u32::from_le_bytes([row[offset], row[offset + 1], row[offset + 2], row[offset + 3]]) as usize
+        u32::from_le_bytes([
+            row[offset],
+            row[offset + 1],
+            row[offset + 2],
+            row[offset + 3],
+        ]) as usize
     } else {
         u16::from_le_bytes([row[offset], row[offset + 1]]) as usize
     };
@@ -3045,6 +3062,7 @@ fn compute_public_key_token(public_key: &[u8]) -> Option<String> {
 }
 
 /// Extract name from the Assembly table (0x20).
+#[allow(clippy::too_many_arguments)]
 fn extract_name_from_assembly_table(
     tilde: &[u8],
     strings: &[u8],

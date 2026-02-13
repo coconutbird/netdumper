@@ -71,7 +71,12 @@ fn load_dac_create_instance(dac_path: &Path) -> Result<CLRDataCreateInstanceFn> 
     let create_instance: CLRDataCreateInstanceFn = unsafe {
         let proc = GetProcAddress(dac_module, windows::core::s!("CLRDataCreateInstance"));
         match proc {
-            Some(p) => std::mem::transmute::<_, CLRDataCreateInstanceFn>(p),
+            Some(p) => {
+                std::mem::transmute::<
+                    unsafe extern "system" fn() -> isize,
+                    CLRDataCreateInstanceFn,
+                >(p)
+            }
             None => return Err(Error::Other("CLRDataCreateInstance not found".into())),
         }
     };
@@ -352,9 +357,7 @@ unsafe fn enumerate_via_dac(sos_dac: &ISOSDacInterface) -> Result<Vec<AssemblyIn
         (actual_domain_count as usize).min(domain_addresses.len())
     };
 
-    for i in 0..domains_to_use {
-        let domain_addr = domain_addresses[i];
-
+    for &domain_addr in domain_addresses.iter().take(domains_to_use) {
         if domain_addr == 0 {
             continue;
         }
@@ -386,9 +389,7 @@ unsafe fn enumerate_via_dac(sos_dac: &ISOSDacInterface) -> Result<Vec<AssemblyIn
 
         let count_to_use = (actual_count as usize).min(asm_addresses.len());
 
-        for j in 0..count_to_use {
-            let asm_addr = asm_addresses[j];
-
+        for &asm_addr in asm_addresses.iter().take(count_to_use) {
             if asm_addr == 0 {
                 continue;
             }
