@@ -555,3 +555,445 @@ pub fn build_pe_with_reconstructed_headers(memory_image: &[u8], pe_info: &PeInfo
 
     file_image
 }
+
+// =============================================================================
+// .NET Metadata Parsing - Assembly Name Extraction
+// =============================================================================
+
+/// Extract the assembly name from .NET metadata in a PE file.
+/// This reads the Assembly table from the #~ stream and looks up the name in #Strings.
+/// Returns None if the file is not a .NET assembly or metadata is corrupted.
+pub fn extract_assembly_name_from_metadata(pe_data: &[u8]) -> Option<String> {
+    // Parse DOS header
+    if pe_data.len() < 64 || pe_data[0] != b'M' || pe_data[1] != b'Z' {
+        return None;
+    }
+
+    let e_lfanew = u32::from_le_bytes([
+        pe_data[0x3C],
+        pe_data[0x3D],
+        pe_data[0x3E],
+        pe_data[0x3F],
+    ]) as usize;
+
+    if e_lfanew + 24 > pe_data.len() {
+        return None;
+    }
+
+    // Check PE signature
+    if pe_data.get(e_lfanew..e_lfanew + 4)? != b"PE\0\0" {
+        return None;
+    }
+
+    // Parse COFF header
+    let coff_offset = e_lfanew + 4;
+    let size_of_optional_header =
+        u16::from_le_bytes([pe_data[coff_offset + 16], pe_data[coff_offset + 17]]) as usize;
+
+    if size_of_optional_header == 0 {
+        return None;
+    }
+
+    // Parse optional header to find CLI header data directory
+    let opt_offset = coff_offset + 20;
+    let magic = u16::from_le_bytes([pe_data[opt_offset], pe_data[opt_offset + 1]]);
+
+    // PE32 = 0x10b, PE32+ = 0x20b
+    let is_pe32_plus = magic == 0x20b;
+    let data_dir_offset = if is_pe32_plus {
+        opt_offset + 112 // PE32+: 112 bytes to data directories
+    } else {
+        opt_offset + 96 // PE32: 96 bytes to data directories
+    };
+
+    // CLI header is data directory entry 14 (COM Descriptor)
+    let cli_dir_offset = data_dir_offset + 14 * 8;
+    if cli_dir_offset + 8 > pe_data.len() {
+        return None;
+    }
+
+    let cli_rva = u32::from_le_bytes([
+        pe_data[cli_dir_offset],
+        pe_data[cli_dir_offset + 1],
+        pe_data[cli_dir_offset + 2],
+        pe_data[cli_dir_offset + 3],
+    ]);
+
+    if cli_rva == 0 {
+        return None; // Not a .NET assembly
+    }
+
+    // Convert RVA to file offset using section headers
+    let cli_offset = rva_to_file_offset(pe_data, e_lfanew, cli_rva as usize)?;
+
+    // Parse CLI header (Cor20Header) - we need metadata RVA at offset 8
+    if cli_offset + 16 > pe_data.len() {
+        return None;
+    }
+
+    let metadata_rva = u32::from_le_bytes([
+        pe_data[cli_offset + 8],
+        pe_data[cli_offset + 9],
+        pe_data[cli_offset + 10],
+        pe_data[cli_offset + 11],
+    ]) as usize;
+
+    let metadata_size = u32::from_le_bytes([
+        pe_data[cli_offset + 12],
+        pe_data[cli_offset + 13],
+        pe_data[cli_offset + 14],
+        pe_data[cli_offset + 15],
+    ]) as usize;
+
+    if metadata_rva == 0 || metadata_size == 0 {
+        return None;
+    }
+
+    let metadata_offset = rva_to_file_offset(pe_data, e_lfanew, metadata_rva)?;
+
+    if metadata_offset + metadata_size > pe_data.len() {
+        return None;
+    }
+
+    let metadata = &pe_data[metadata_offset..metadata_offset + metadata_size];
+
+    // Parse metadata root - check BSJB signature
+    if metadata.len() < 16 || metadata[0..4] != [0x42, 0x53, 0x4A, 0x42] {
+        return None;
+    }
+
+    // Skip: signature(4) + major(2) + minor(2) + reserved(4) + version_length(4)
+    let version_length =
+        u32::from_le_bytes([metadata[12], metadata[13], metadata[14], metadata[15]]) as usize;
+
+    // Version string is padded to 4-byte boundary
+    let version_padded = (version_length + 3) & !3;
+    let streams_offset = 16 + version_padded;
+
+    if streams_offset + 4 > metadata.len() {
+        return None;
+    }
+
+    // Skip flags(2), read number of streams(2)
+    let num_streams =
+        u16::from_le_bytes([metadata[streams_offset + 2], metadata[streams_offset + 3]]) as usize;
+
+    // Parse stream headers to find #Strings and #~
+    let mut strings_offset = 0usize;
+    let mut strings_size = 0usize;
+    let mut tilde_offset = 0usize;
+    let mut tilde_size = 0usize;
+
+    let mut pos = streams_offset + 4;
+    for _ in 0..num_streams {
+        if pos + 8 > metadata.len() {
+            break;
+        }
+
+        let stream_offset =
+            u32::from_le_bytes([metadata[pos], metadata[pos + 1], metadata[pos + 2], metadata[pos + 3]])
+                as usize;
+        let stream_size = u32::from_le_bytes([
+            metadata[pos + 4],
+            metadata[pos + 5],
+            metadata[pos + 6],
+            metadata[pos + 7],
+        ]) as usize;
+
+        pos += 8;
+
+        // Read stream name (null-terminated, padded to 4 bytes)
+        let name_start = pos;
+        while pos < metadata.len() && metadata[pos] != 0 {
+            pos += 1;
+        }
+        let name = std::str::from_utf8(&metadata[name_start..pos]).unwrap_or("");
+        pos += 1; // Skip null terminator
+        pos = (pos + 3) & !3; // Align to 4 bytes
+
+        match name {
+            "#Strings" => {
+                strings_offset = stream_offset;
+                strings_size = stream_size;
+            }
+            "#~" | "#-" => {
+                tilde_offset = stream_offset;
+                tilde_size = stream_size;
+            }
+            _ => {}
+        }
+    }
+
+    if strings_offset == 0 || tilde_offset == 0 {
+        return None;
+    }
+
+    // Parse #~ stream to find Assembly table
+    let tilde_data = metadata.get(tilde_offset..tilde_offset + tilde_size)?;
+    let strings_data = metadata.get(strings_offset..strings_offset + strings_size)?;
+
+    extract_assembly_name_from_tilde_stream(tilde_data, strings_data)
+}
+
+/// Parse the #~ stream and extract the assembly name from the Assembly table.
+fn extract_assembly_name_from_tilde_stream(tilde: &[u8], strings: &[u8]) -> Option<String> {
+    // #~ stream header:
+    // Reserved: u32 (0)
+    // MajorVersion: u8
+    // MinorVersion: u8
+    // HeapSizes: u8 (bit 0 = #Strings uses 4 bytes, bit 1 = #GUID uses 4 bytes, bit 2 = #Blob uses 4 bytes)
+    // Reserved: u8
+    // Valid: u64 (bitmask of present tables)
+    // Sorted: u64
+    // Rows: u32[] (row count for each present table)
+
+    if tilde.len() < 24 {
+        return None;
+    }
+
+    let heap_sizes = tilde[6];
+    let string_index_size = if heap_sizes & 0x01 != 0 { 4 } else { 2 };
+    let blob_index_size = if heap_sizes & 0x04 != 0 { 4 } else { 2 };
+
+    let valid = u64::from_le_bytes([
+        tilde[8], tilde[9], tilde[10], tilde[11], tilde[12], tilde[13], tilde[14], tilde[15],
+    ]);
+
+    // Count present tables and find Assembly table (0x20 = bit 32)
+    let assembly_table_bit = 1u64 << 0x20;
+    if valid & assembly_table_bit == 0 {
+        return None; // No Assembly table
+    }
+
+    // Read row counts for all present tables
+    let mut pos = 24usize; // After header
+    let mut assembly_table_offset = 0usize;
+    let mut row_counts: Vec<u32> = Vec::new();
+
+    for i in 0..64 {
+        if valid & (1u64 << i) != 0 {
+            if pos + 4 > tilde.len() {
+                return None;
+            }
+            let count =
+                u32::from_le_bytes([tilde[pos], tilde[pos + 1], tilde[pos + 2], tilde[pos + 3]]);
+            row_counts.push(count);
+            pos += 4;
+        }
+    }
+
+    // Calculate offset to Assembly table by summing sizes of preceding tables
+    let tables_start = pos;
+    let mut current_offset = tables_start;
+
+    for i in 0..64 {
+        if valid & (1u64 << i) != 0 {
+            if i == 0x20 {
+                assembly_table_offset = current_offset;
+                break;
+            }
+            // Calculate row size for this table
+            let row_size = get_table_row_size(i, &row_counts, valid, string_index_size, blob_index_size);
+            let table_index = count_bits_before(valid, i);
+            let row_count = *row_counts.get(table_index)? as usize;
+            current_offset += row_size * row_count;
+        }
+    }
+
+    if assembly_table_offset == 0 {
+        return None;
+    }
+
+    // Assembly table row format:
+    // HashAlgId: u32
+    // MajorVersion: u16
+    // MinorVersion: u16
+    // BuildNumber: u16
+    // RevisionNumber: u16
+    // Flags: u32
+    // PublicKey: Blob index
+    // Name: String index
+    // Culture: String index
+
+    let name_offset_in_row = 4 + 2 + 2 + 2 + 2 + 4 + blob_index_size;
+    let name_pos = assembly_table_offset + name_offset_in_row;
+
+    if name_pos + string_index_size > tilde.len() {
+        return None;
+    }
+
+    let name_index = if string_index_size == 4 {
+        u32::from_le_bytes([
+            tilde[name_pos],
+            tilde[name_pos + 1],
+            tilde[name_pos + 2],
+            tilde[name_pos + 3],
+        ]) as usize
+    } else {
+        u16::from_le_bytes([tilde[name_pos], tilde[name_pos + 1]]) as usize
+    };
+
+    // Look up name in #Strings heap
+    if name_index >= strings.len() {
+        return None;
+    }
+
+    let name_bytes = &strings[name_index..];
+    let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+    let name = std::str::from_utf8(&name_bytes[..end]).ok()?;
+
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Count how many bits are set before position `bit` in the bitmask.
+fn count_bits_before(valid: u64, bit: usize) -> usize {
+    let mask = (1u64 << bit) - 1;
+    (valid & mask).count_ones() as usize
+}
+
+/// Get the row size for a metadata table.
+/// This is a simplified version - we only need accurate sizes for tables before Assembly (0x20).
+fn get_table_row_size(
+    table: usize,
+    row_counts: &[u32],
+    valid: u64,
+    string_idx_size: usize,
+    blob_idx_size: usize,
+) -> usize {
+    // Simplified table row sizes - we only need tables 0x00 to 0x1F
+    // For a complete implementation, each table has specific column definitions
+    // Reference: ECMA-335 II.22
+
+    let guid_idx_size = 2usize; // Simplified - could be 4 if #GUID is large
+
+    // Helper to get coded index size
+    let coded_idx_size = |tag_bits: usize, tables: &[usize]| -> usize {
+        let max_rows = tables
+            .iter()
+            .filter_map(|&t| {
+                if valid & (1u64 << t) != 0 {
+                    let idx = count_bits_before(valid, t);
+                    row_counts.get(idx).copied()
+                } else {
+                    Some(0)
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        if max_rows < (1 << (16 - tag_bits)) {
+            2
+        } else {
+            4
+        }
+    };
+
+    match table {
+        0x00 => 4 + string_idx_size * 2 + guid_idx_size * 3, // Module
+        0x01 => coded_idx_size(2, &[0x00, 0x1A, 0x23, 0x01]) + string_idx_size * 2, // TypeRef
+        0x02 => {
+            // TypeDef
+            4 + string_idx_size * 2
+                + coded_idx_size(3, &[0x01, 0x02, 0x1B])
+                + simple_idx_size(row_counts, valid, 0x04)
+                + simple_idx_size(row_counts, valid, 0x06)
+        }
+        0x04 => 2 + string_idx_size + blob_idx_size, // Field
+        0x06 => {
+            // MethodDef
+            4 + 2 + 2 + string_idx_size + blob_idx_size + simple_idx_size(row_counts, valid, 0x08)
+        }
+        0x08 => 2 + string_idx_size + blob_idx_size, // Param
+        0x09 => {
+            // InterfaceImpl
+            simple_idx_size(row_counts, valid, 0x02) + coded_idx_size(3, &[0x01, 0x02, 0x1B])
+        }
+        0x0A => coded_idx_size(3, &[0x01, 0x02, 0x1B]) + string_idx_size + blob_idx_size, // MemberRef
+        0x0B => coded_idx_size(5, &[0x00, 0x01, 0x02, 0x04, 0x06, 0x08, 0x09, 0x0A, 0x0E, 0x11, 0x14, 0x17, 0x20, 0x23, 0x26, 0x27, 0x28]) + coded_idx_size(2, &[0x04, 0x06, 0x00, 0x00]) + blob_idx_size, // Constant
+        0x0C => coded_idx_size(5, &[0x00, 0x01, 0x02, 0x04, 0x06, 0x08, 0x09, 0x0A, 0x0E, 0x11, 0x14, 0x17, 0x20, 0x23, 0x26, 0x27, 0x28]) + coded_idx_size(3, &[0x00, 0x00, 0x0A, 0x00]) + blob_idx_size, // CustomAttribute
+        0x0D => coded_idx_size(1, &[0x04, 0x08]) + blob_idx_size, // FieldMarshal
+        0x0E => 2 + blob_idx_size,                   // DeclSecurity
+        0x0F => 2 + 4 + 4 + simple_idx_size(row_counts, valid, 0x02), // ClassLayout
+        0x10 => 4 + simple_idx_size(row_counts, valid, 0x04), // FieldLayout
+        0x11 => blob_idx_size,                       // StandAloneSig
+        0x12 => simple_idx_size(row_counts, valid, 0x02) + simple_idx_size(row_counts, valid, 0x04), // EventMap
+        0x14 => 2 + string_idx_size + coded_idx_size(3, &[0x01, 0x02, 0x1B]), // Event
+        0x15 => simple_idx_size(row_counts, valid, 0x02) + simple_idx_size(row_counts, valid, 0x17), // PropertyMap
+        0x17 => 2 + string_idx_size + blob_idx_size, // Property
+        0x18 => 2 + coded_idx_size(1, &[0x06, 0x0A]) + coded_idx_size(5, &[0x00, 0x01, 0x02, 0x04, 0x06, 0x08, 0x09, 0x0A, 0x0E, 0x11, 0x14, 0x17, 0x20, 0x23, 0x26, 0x27, 0x28]), // MethodSemantics
+        0x19 => simple_idx_size(row_counts, valid, 0x02) + coded_idx_size(2, &[0x02, 0x1B]) + simple_idx_size(row_counts, valid, 0x06), // MethodImpl
+        0x1A => string_idx_size,                     // ModuleRef
+        0x1B => blob_idx_size,                       // TypeSpec
+        0x1C => 2 + coded_idx_size(3, &[0x01, 0x02, 0x1B]) + string_idx_size + string_idx_size, // ImplMap
+        0x1D => 4 + simple_idx_size(row_counts, valid, 0x04), // FieldRVA
+        0x20 => 4 + 2 + 2 + 2 + 2 + 4 + blob_idx_size + string_idx_size * 2, // Assembly
+        _ => 0, // We don't need tables after Assembly
+    }
+}
+
+/// Get simple table index size (2 or 4 bytes based on row count).
+fn simple_idx_size(row_counts: &[u32], valid: u64, table: usize) -> usize {
+    if valid & (1u64 << table) == 0 {
+        return 2;
+    }
+    let idx = count_bits_before(valid, table);
+    let count = row_counts.get(idx).copied().unwrap_or(0);
+    if count < 0x10000 {
+        2
+    } else {
+        4
+    }
+}
+
+/// Convert an RVA to a file offset using section headers.
+fn rva_to_file_offset(pe_data: &[u8], e_lfanew: usize, rva: usize) -> Option<usize> {
+    let coff_offset = e_lfanew + 4;
+    let number_of_sections =
+        u16::from_le_bytes([pe_data[coff_offset + 2], pe_data[coff_offset + 3]]) as usize;
+    let size_of_optional_header =
+        u16::from_le_bytes([pe_data[coff_offset + 16], pe_data[coff_offset + 17]]) as usize;
+
+    let section_table_offset = coff_offset + 20 + size_of_optional_header;
+
+    for i in 0..number_of_sections {
+        let section_offset = section_table_offset + i * 40;
+        if section_offset + 40 > pe_data.len() {
+            break;
+        }
+
+        let virtual_size = u32::from_le_bytes([
+            pe_data[section_offset + 8],
+            pe_data[section_offset + 9],
+            pe_data[section_offset + 10],
+            pe_data[section_offset + 11],
+        ]) as usize;
+
+        let virtual_address = u32::from_le_bytes([
+            pe_data[section_offset + 12],
+            pe_data[section_offset + 13],
+            pe_data[section_offset + 14],
+            pe_data[section_offset + 15],
+        ]) as usize;
+
+        let pointer_to_raw_data = u32::from_le_bytes([
+            pe_data[section_offset + 20],
+            pe_data[section_offset + 21],
+            pe_data[section_offset + 22],
+            pe_data[section_offset + 23],
+        ]) as usize;
+
+        if rva >= virtual_address && rva < virtual_address + virtual_size {
+            return Some(pointer_to_raw_data + (rva - virtual_address));
+        }
+    }
+
+    // If not in any section, assume it's in the header (RVA == file offset)
+    if rva < 0x1000 {
+        Some(rva)
+    } else {
+        None
+    }
+}

@@ -10,8 +10,8 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 
 use crate::pe::{
-    build_pe_with_reconstructed_headers, convert_memory_to_file_layout, is_pe_header_corrupted,
-    read_pe_info, reconstruct_pe_info,
+    build_pe_with_reconstructed_headers, convert_memory_to_file_layout,
+    extract_assembly_name_from_metadata, is_pe_header_corrupted, read_pe_info, reconstruct_pe_info,
 };
 use crate::process::enumerate_assemblies_external;
 use crate::target::ProcessInfo;
@@ -70,12 +70,14 @@ pub fn dump_assembly(
     output_dir: &std::path::Path,
     machine_type: u16,
 ) -> DumpResult {
-    let safe_name = sanitize_filename(&assembly.name);
-    let output_path = output_dir.join(format!("{}.dll", safe_name));
+    // We'll determine the final name after reading the assembly
+    let fallback_name = assembly.name.clone();
 
     if assembly.base_address == 0 {
+        let safe_name = sanitize_filename(&fallback_name);
+        let output_path = output_dir.join(format!("{}.dll", safe_name));
         return DumpResult {
-            name: assembly.name.clone(),
+            name: fallback_name,
             output_path,
             size: 0,
             success: false,
@@ -90,8 +92,10 @@ pub fn dump_assembly(
         None => match reconstruct_pe_info(process_handle, assembly.base_address, machine_type) {
             Some(info) => (info, true),
             None => {
+                let safe_name = sanitize_filename(&fallback_name);
+                let output_path = output_dir.join(format!("{}.dll", safe_name));
                 return DumpResult {
-                    name: assembly.name.clone(),
+                    name: fallback_name,
                     output_path,
                     size: 0,
                     success: false,
@@ -136,16 +140,21 @@ pub fn dump_assembly(
         convert_memory_to_file_layout(&buffer, &pe_info)
     };
 
+    // Try to extract the real assembly name from .NET metadata
+    let final_name = extract_assembly_name_from_metadata(&file_image).unwrap_or(fallback_name);
+    let safe_name = sanitize_filename(&final_name);
+    let output_path = output_dir.join(format!("{}.dll", safe_name));
+
     match std::fs::write(&output_path, &file_image) {
         Ok(()) => DumpResult {
-            name: assembly.name.clone(),
+            name: final_name,
             output_path,
             size: file_image.len(),
             success: true,
             error: None,
         },
         Err(e) => DumpResult {
-            name: assembly.name.clone(),
+            name: final_name,
             output_path,
             size: file_image.len(),
             success: false,
