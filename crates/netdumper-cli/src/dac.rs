@@ -809,12 +809,44 @@ pub struct DumpResult {
     pub error: Option<String>,
 }
 
-/// Read the PE image size from a process by parsing the PE header at the given base address.
-/// Returns the SizeOfImage from the PE OptionalHeader, or None if parsing fails.
-fn read_pe_image_size(process_handle: HANDLE, base_address: usize) -> Option<u32> {
+/// Section header information for PE reconstruction
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct SectionInfo {
+    /// Virtual address (RVA) of the section
+    virtual_address: u32,
+    /// Size of the section in memory
+    virtual_size: u32,
+    /// File offset of the section
+    pointer_to_raw_data: u32,
+    /// Size of the section on disk
+    size_of_raw_data: u32,
+}
+
+/// PE header information needed for dumping
+#[derive(Debug)]
+#[allow(dead_code)]
+struct PeInfo {
+    /// Offset to PE signature (e_lfanew)
+    e_lfanew: u32,
+    /// Size of the image in memory
+    size_of_image: u32,
+    /// Size of headers on disk
+    size_of_headers: u32,
+    /// Number of sections
+    number_of_sections: u16,
+    /// Size of optional header
+    size_of_optional_header: u16,
+    /// Section information
+    sections: Vec<SectionInfo>,
+    /// Whether this is PE32+ (64-bit)
+    is_pe32_plus: bool,
+}
+
+/// Read PE header information from a process
+fn read_pe_info(process_handle: HANDLE, base_address: usize) -> Option<PeInfo> {
     // DOS Header: we need e_lfanew at offset 0x3C (4 bytes)
-    // First, read the DOS header magic and e_lfanew
-    let mut dos_header = [0u8; 64]; // DOS header is 64 bytes
+    let mut dos_header = [0u8; 64];
     let mut bytes_read = 0usize;
 
     let result = unsafe {
@@ -831,31 +863,26 @@ fn read_pe_image_size(process_handle: HANDLE, base_address: usize) -> Option<u32
         return None;
     }
 
-    // Check DOS magic "MZ" (0x5A4D)
+    // Check DOS magic "MZ"
     if dos_header[0] != 0x4D || dos_header[1] != 0x5A {
         return None;
     }
 
-    // e_lfanew is at offset 0x3C (little-endian u32)
     let e_lfanew = u32::from_le_bytes([
         dos_header[0x3C],
         dos_header[0x3D],
         dos_header[0x3E],
         dos_header[0x3F],
-    ]) as usize;
+    ]);
 
-    // Sanity check - e_lfanew shouldn't be too large or too small
     if e_lfanew < 64 || e_lfanew > 1024 {
         return None;
     }
 
-    // Read PE header: PE signature (4 bytes) + COFF header (20 bytes) + OptionalHeader
-    // SizeOfImage is at offset 56 in OptionalHeader for PE32, offset 56 for PE32+
-    // We need: PE signature (4) + COFF header (20) + OptionalHeader up to SizeOfImage
-    // OptionalHeader offset to SizeOfImage: 56 bytes
-    // Total: 4 + 20 + 56 + 4 = 84 bytes from PE signature start
-    let pe_header_offset = base_address + e_lfanew;
-    let mut pe_header = [0u8; 84];
+    // Read PE header + COFF header + full optional header
+    // We need enough to get section count and all optional header fields
+    let pe_header_offset = base_address + e_lfanew as usize;
+    let mut pe_header = [0u8; 264]; // PE sig (4) + COFF (20) + OptionalHeader (up to 240)
 
     let result = unsafe {
         ReadProcessMemory(
@@ -867,46 +894,152 @@ fn read_pe_image_size(process_handle: HANDLE, base_address: usize) -> Option<u32
         )
     };
 
-    if result.is_err() || bytes_read < 84 {
+    if result.is_err() || bytes_read < 264 {
         return None;
     }
 
-    // Check PE signature "PE\0\0" (0x00004550)
-    if pe_header[0] != 0x50 || pe_header[1] != 0x45 || pe_header[2] != 0x00 || pe_header[3] != 0x00
-    {
+    // Check PE signature
+    if pe_header[0] != 0x50 || pe_header[1] != 0x45 || pe_header[2] != 0 || pe_header[3] != 0 {
         return None;
     }
 
-    // COFF header is 20 bytes starting at offset 4
-    // OptionalHeader starts at offset 24
-    // Check OptionalHeader magic to determine PE32 vs PE32+
+    // COFF header starts at offset 4
+    // NumberOfSections at COFF+2
+    let number_of_sections = u16::from_le_bytes([pe_header[6], pe_header[7]]);
+    // SizeOfOptionalHeader at COFF+16
+    let size_of_optional_header = u16::from_le_bytes([pe_header[20], pe_header[21]]);
+
+    // Optional header starts at offset 24
     let optional_magic = u16::from_le_bytes([pe_header[24], pe_header[25]]);
+    let is_pe32_plus = optional_magic == 0x20b;
 
-    // SizeOfImage offset within OptionalHeader:
-    // PE32 (magic 0x10b): offset 56
-    // PE32+ (magic 0x20b): offset 56 (same position, different struct layout before it)
-    let size_of_image_offset = match optional_magic {
-        0x10b | 0x20b => 24 + 56, // OptionalHeader start + 56
-        _ => return None,
-    };
+    // SizeOfHeaders offset: OptionalHeader + 60 (PE32) or OptionalHeader + 60 (PE32+)
+    // SizeOfImage offset: OptionalHeader + 56
+    let size_of_image =
+        u32::from_le_bytes([pe_header[80], pe_header[81], pe_header[82], pe_header[83]]);
+    let size_of_headers =
+        u32::from_le_bytes([pe_header[84], pe_header[85], pe_header[86], pe_header[87]]);
 
-    // Read SizeOfImage (4 bytes, little-endian)
-    let size_of_image = u32::from_le_bytes([
-        pe_header[size_of_image_offset],
-        pe_header[size_of_image_offset + 1],
-        pe_header[size_of_image_offset + 2],
-        pe_header[size_of_image_offset + 3],
-    ]);
-
-    // Sanity check - size should be reasonable (at least 4KB, less than 1GB)
+    // Sanity checks
     if size_of_image < 0x1000 || size_of_image > 0x40000000 {
         return None;
     }
+    if number_of_sections > 96 {
+        return None;
+    }
 
-    Some(size_of_image)
+    // Read section headers
+    // Section table starts immediately after optional header
+    let section_table_offset = pe_header_offset + 24 + size_of_optional_header as usize;
+    let section_table_size = number_of_sections as usize * 40; // Each section header is 40 bytes
+    let mut section_data = vec![0u8; section_table_size];
+
+    let result = unsafe {
+        ReadProcessMemory(
+            process_handle,
+            section_table_offset as *const c_void,
+            section_data.as_mut_ptr() as *mut c_void,
+            section_table_size,
+            Some(&mut bytes_read),
+        )
+    };
+
+    if result.is_err() || bytes_read < section_table_size {
+        return None;
+    }
+
+    let mut sections = Vec::with_capacity(number_of_sections as usize);
+    for i in 0..number_of_sections as usize {
+        let offset = i * 40;
+        // VirtualSize at section+8
+        let virtual_size = u32::from_le_bytes([
+            section_data[offset + 8],
+            section_data[offset + 9],
+            section_data[offset + 10],
+            section_data[offset + 11],
+        ]);
+        // VirtualAddress at section+12
+        let virtual_address = u32::from_le_bytes([
+            section_data[offset + 12],
+            section_data[offset + 13],
+            section_data[offset + 14],
+            section_data[offset + 15],
+        ]);
+        // SizeOfRawData at section+16
+        let size_of_raw_data = u32::from_le_bytes([
+            section_data[offset + 16],
+            section_data[offset + 17],
+            section_data[offset + 18],
+            section_data[offset + 19],
+        ]);
+        // PointerToRawData at section+20
+        let pointer_to_raw_data = u32::from_le_bytes([
+            section_data[offset + 20],
+            section_data[offset + 21],
+            section_data[offset + 22],
+            section_data[offset + 23],
+        ]);
+
+        sections.push(SectionInfo {
+            virtual_address,
+            virtual_size,
+            pointer_to_raw_data,
+            size_of_raw_data,
+        });
+    }
+
+    Some(PeInfo {
+        e_lfanew,
+        size_of_image,
+        size_of_headers,
+        number_of_sections,
+        size_of_optional_header,
+        sections,
+        is_pe32_plus,
+    })
+}
+
+/// Convert a PE image from memory layout (RVA-based) to file layout (file offset-based)
+/// This "unrolls" sections from their virtual addresses to their file offsets
+fn convert_memory_to_file_layout(memory_image: &[u8], pe_info: &PeInfo) -> Vec<u8> {
+    // Calculate the file size: find the maximum (PointerToRawData + SizeOfRawData)
+    let mut file_size = pe_info.size_of_headers as usize;
+    for section in &pe_info.sections {
+        let section_end = section.pointer_to_raw_data as usize + section.size_of_raw_data as usize;
+        if section_end > file_size {
+            file_size = section_end;
+        }
+    }
+
+    // Create output buffer
+    let mut file_image = vec![0u8; file_size];
+
+    // Copy headers (up to SizeOfHeaders, which is already at file offsets = RVAs for headers)
+    let headers_size = (pe_info.size_of_headers as usize).min(memory_image.len());
+    file_image[..headers_size].copy_from_slice(&memory_image[..headers_size]);
+
+    // Copy each section from its virtual address to its file offset
+    for section in &pe_info.sections {
+        let src_offset = section.virtual_address as usize;
+        let dst_offset = section.pointer_to_raw_data as usize;
+
+        // Use the smaller of virtual_size and size_of_raw_data to copy
+        let copy_size = (section.size_of_raw_data as usize)
+            .min(section.virtual_size as usize)
+            .min(memory_image.len().saturating_sub(src_offset))
+            .min(file_image.len().saturating_sub(dst_offset));
+
+        if copy_size > 0 && src_offset < memory_image.len() && dst_offset < file_image.len() {
+            file_image[dst_offset..dst_offset + copy_size]
+                .copy_from_slice(&memory_image[src_offset..src_offset + copy_size]);
+        }
+    }
+
+    file_image
 }
 
 /// Dump a single assembly from a process to a file
+/// Converts from memory layout (RVA-based) to file layout (file offset-based)
 pub fn dump_assembly(
     process_handle: HANDLE,
     assembly: &AssemblyInfo,
@@ -926,66 +1059,62 @@ pub fn dump_assembly(
         };
     }
 
-    // Read the actual PE image size from the PE header
-    // This gives us the real SizeOfImage, not just metadata size
-    let image_size = match read_pe_image_size(process_handle, assembly.base_address) {
-        Some(size) => size as usize,
+    // Read PE info to get section layout and image size
+    let pe_info = match read_pe_info(process_handle, assembly.base_address) {
+        Some(info) => info,
         None => {
-            // Fall back to assembly.size if PE parsing fails, but warn about it
-            if assembly.size == 0 {
-                return DumpResult {
-                    name: assembly.name.clone(),
-                    output_path,
-                    size: 0,
-                    success: false,
-                    error: Some("Could not determine assembly size (PE header unreadable and no fallback size)".into()),
-                };
-            }
-            // Use the metadata size as fallback (won't be complete but better than nothing)
-            assembly.size
+            return DumpResult {
+                name: assembly.name.clone(),
+                output_path,
+                size: 0,
+                success: false,
+                error: Some("Could not parse PE header".into()),
+            };
         }
     };
 
-    // Read the assembly bytes from the target process
+    let image_size = pe_info.size_of_image as usize;
+
+    // Read the assembly bytes from the target process (memory layout)
+    // We read page-by-page because the image may have gaps (guard pages, PAGE_NOACCESS regions)
+    // between sections that would cause a single large ReadProcessMemory to fail
     let mut buffer = vec![0u8; image_size];
-    let mut bytes_read = 0usize;
+    const PAGE_SIZE: usize = 0x1000;
 
-    let result = unsafe {
-        ReadProcessMemory(
-            process_handle,
-            assembly.base_address as *const c_void,
-            buffer.as_mut_ptr() as *mut c_void,
-            image_size,
-            Some(&mut bytes_read),
-        )
-    };
+    for offset in (0..image_size).step_by(PAGE_SIZE) {
+        let chunk_size = PAGE_SIZE.min(image_size - offset);
+        let mut bytes_read = 0usize;
 
-    if result.is_err() {
-        return DumpResult {
-            name: assembly.name.clone(),
-            output_path,
-            size: 0,
-            success: false,
-            error: Some(format!("ReadProcessMemory failed: {:?}", result.err())),
+        let _ = unsafe {
+            ReadProcessMemory(
+                process_handle,
+                (assembly.base_address + offset) as *const c_void,
+                buffer[offset..].as_mut_ptr() as *mut c_void,
+                chunk_size,
+                Some(&mut bytes_read),
+            )
         };
+        // Ignore errors - pages that fail to read will remain zeroed
+        // This handles guard pages, uncommitted memory, etc.
     }
 
-    // Truncate buffer to actual bytes read
-    buffer.truncate(bytes_read);
+    // Convert from memory layout to file layout
+    // This "unrolls" sections from their virtual addresses to their file offsets
+    let file_image = convert_memory_to_file_layout(&buffer, &pe_info);
 
     // Write to file
-    match std::fs::write(&output_path, &buffer) {
+    match std::fs::write(&output_path, &file_image) {
         Ok(()) => DumpResult {
             name: assembly.name.clone(),
             output_path,
-            size: bytes_read,
+            size: file_image.len(),
             success: true,
             error: None,
         },
         Err(e) => DumpResult {
             name: assembly.name.clone(),
             output_path,
-            size: bytes_read,
+            size: file_image.len(),
             success: false,
             error: Some(format!("Failed to write file: {}", e)),
         },
