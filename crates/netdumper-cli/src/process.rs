@@ -467,6 +467,14 @@ unsafe fn get_assembly_info(
             if hr.is_ok() {
                 base_address = module_data.ilBase;
                 size = module_data.metadataSize as u32;
+
+                let mut info = AssemblyInfo::new(name, base_address as usize, size as usize);
+                info.path = path;
+                info.is_reflection = module_data.bIsReflection != 0;
+                info.is_pe_file = module_data.bIsPEFile != 0;
+                info.metadata_address = module_data.metadataStart as usize;
+                info.metadata_size = module_data.metadataSize as usize;
+                return Some(info);
             }
         }
     }

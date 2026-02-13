@@ -11,7 +11,8 @@ use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 
 use crate::pe::{
     build_pe_with_reconstructed_headers, convert_memory_to_file_layout,
-    extract_assembly_name_from_metadata, is_pe_header_corrupted, read_pe_info, reconstruct_pe_info,
+    extract_assembly_name_from_metadata, extract_assembly_name_from_metadata_debug,
+    is_pe_header_corrupted, read_pe_info, reconstruct_pe_info, validate_cli_header_in_memory,
 };
 use crate::process::enumerate_assemblies_external;
 use crate::target::ProcessInfo;
@@ -73,6 +74,19 @@ pub fn dump_assembly(
     // We'll determine the final name after reading the assembly
     let fallback_name = assembly.name.clone();
 
+    // Check if this is a reflection/dynamic assembly that can't be dumped as PE
+    if assembly.is_reflection && !assembly.is_pe_file {
+        let safe_name = sanitize_filename(&fallback_name);
+        let output_path = output_dir.join(format!("{}.dll", safe_name));
+        return DumpResult {
+            name: fallback_name,
+            output_path,
+            size: 0,
+            success: false,
+            error: Some("Dynamic/Reflection assembly (no PE file)".into()),
+        };
+    }
+
     if assembly.base_address == 0 {
         let safe_name = sanitize_filename(&fallback_name);
         let output_path = output_dir.join(format!("{}.dll", safe_name));
@@ -104,6 +118,21 @@ pub fn dump_assembly(
             }
         },
     };
+
+    // // Validate that the CLI header is valid in memory
+    // // This catches cases where ilBase doesn't point to a real PE image
+    // // TODO: We need to decide what to do here
+    // if !validate_cli_header_in_memory(process_handle, assembly.base_address, &pe_info) {
+    //     let safe_name = sanitize_filename(&fallback_name);
+    //     let output_path = output_dir.join(format!("{}.dll", safe_name));
+    //     return DumpResult {
+    //         name: fallback_name,
+    //         output_path,
+    //         size: 0,
+    //         success: false,
+    //         error: Some("Invalid CLI header (ilBase may not point to valid PE)".into()),
+    //     };
+    // }
 
     let image_size = pe_info.size_of_image as usize;
 
@@ -141,7 +170,16 @@ pub fn dump_assembly(
     };
 
     // Try to extract the real assembly name from .NET metadata
-    let final_name = extract_assembly_name_from_metadata(&file_image).unwrap_or(fallback_name);
+    let final_name = match extract_assembly_name_from_metadata_debug(&file_image) {
+        Ok(name) => name,
+        Err(e) => {
+            eprintln!(
+                "  [DEBUG] {} metadata error: {:?} (reconstruction={})",
+                fallback_name, e, use_reconstruction
+            );
+            fallback_name
+        }
+    };
     let safe_name = sanitize_filename(&final_name);
     let output_path = output_dir.join(format!("{}.dll", safe_name));
 

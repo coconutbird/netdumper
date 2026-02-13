@@ -188,6 +188,101 @@ pub fn read_pe_info(process_handle: HANDLE, base_address: usize) -> Option<PeInf
     })
 }
 
+/// Validate that the PE has a valid CLI header in memory.
+/// Returns true if the CLI header at the given RVA contains valid .NET metadata.
+pub fn validate_cli_header_in_memory(
+    process_handle: HANDLE,
+    base_address: usize,
+    pe_info: &PeInfo,
+) -> bool {
+    // Find the CLI header data directory
+    // In PE32, data directories start at optional header offset 96
+    // In PE32+, data directories start at optional header offset 112
+    // CLI header is data directory index 14
+
+    let pe_header_offset = base_address + pe_info.e_lfanew as usize;
+    let data_dir_base_offset = if pe_info.is_pe32_plus { 112 } else { 96 };
+    let cli_dir_offset = pe_header_offset + 24 + data_dir_base_offset + 14 * 8;
+
+    let mut cli_dir = [0u8; 8];
+    let mut bytes_read = 0usize;
+
+    let result = unsafe {
+        ReadProcessMemory(
+            process_handle,
+            cli_dir_offset as *const c_void,
+            cli_dir.as_mut_ptr() as *mut c_void,
+            8,
+            Some(&mut bytes_read),
+        )
+    };
+
+    if result.is_err() || bytes_read < 8 {
+        return false;
+    }
+
+    let cli_rva = u32::from_le_bytes([cli_dir[0], cli_dir[1], cli_dir[2], cli_dir[3]]);
+    let cli_size = u32::from_le_bytes([cli_dir[4], cli_dir[5], cli_dir[6], cli_dir[7]]);
+
+    if cli_rva == 0 || cli_size < 72 {
+        return false;
+    }
+
+    // Read the CLI header from memory
+    let cli_header_addr = base_address + cli_rva as usize;
+    let mut cli_header = [0u8; 16];
+
+    let result = unsafe {
+        ReadProcessMemory(
+            process_handle,
+            cli_header_addr as *const c_void,
+            cli_header.as_mut_ptr() as *mut c_void,
+            16,
+            Some(&mut bytes_read),
+        )
+    };
+
+    if result.is_err() || bytes_read < 16 {
+        return false;
+    }
+
+    // Validate CLI header structure:
+    // - cb (size) should be 0x48 (72 bytes)
+    // - MajorRuntimeVersion should be 2
+    // - MinorRuntimeVersion should be 0 or 5
+    let cb = u32::from_le_bytes([cli_header[0], cli_header[1], cli_header[2], cli_header[3]]);
+    let major_version = u16::from_le_bytes([cli_header[4], cli_header[5]]);
+    let minor_version = u16::from_le_bytes([cli_header[6], cli_header[7]]);
+
+    // cb should be 0x48, major should be 2, minor should be 0 or 5
+    if cb != 0x48 {
+        return false;
+    }
+    if major_version != 2 {
+        return false;
+    }
+    if minor_version != 0 && minor_version != 5 {
+        return false;
+    }
+
+    // Also validate metadata RVA is reasonable
+    let meta_rva =
+        u32::from_le_bytes([cli_header[8], cli_header[9], cli_header[10], cli_header[11]]);
+    let meta_size = u32::from_le_bytes([
+        cli_header[12],
+        cli_header[13],
+        cli_header[14],
+        cli_header[15],
+    ]);
+
+    // Metadata RVA should be less than image size
+    if meta_rva == 0 || meta_size == 0 || meta_rva > pe_info.size_of_image {
+        return false;
+    }
+
+    true
+}
+
 // =============================================================================
 // Layout Conversion
 // =============================================================================
@@ -560,6 +655,141 @@ pub fn build_pe_with_reconstructed_headers(memory_image: &[u8], pe_info: &PeInfo
 // .NET Metadata Parsing - Assembly Name Extraction
 // =============================================================================
 
+/// Debug info for metadata extraction failures
+#[derive(Debug)]
+pub enum MetadataError {
+    TooSmall,
+    NoDosSignature,
+    InvalidPeOffset,
+    NoPeSignature,
+    NoOptionalHeader,
+    NoCliHeader,
+    CliOffsetInvalid,
+    NoMetadata,
+    MetadataOffsetInvalid,
+    NoBsjbSignature,
+    StreamParseError,
+    NoTildeStream,
+    NoStringsStream,
+    NoAssemblyTable,
+    NameIndexOutOfBounds,
+}
+
+/// Extract the assembly name with detailed error info for debugging
+pub fn extract_assembly_name_from_metadata_debug(pe_data: &[u8]) -> Result<String, MetadataError> {
+    // Parse DOS header
+    if pe_data.len() < 64 {
+        return Err(MetadataError::TooSmall);
+    }
+    if pe_data[0] != b'M' || pe_data[1] != b'Z' {
+        return Err(MetadataError::NoDosSignature);
+    }
+
+    let e_lfanew =
+        u32::from_le_bytes([pe_data[0x3C], pe_data[0x3D], pe_data[0x3E], pe_data[0x3F]]) as usize;
+
+    if e_lfanew + 24 > pe_data.len() {
+        return Err(MetadataError::InvalidPeOffset);
+    }
+
+    // Check PE signature
+    if pe_data.get(e_lfanew..e_lfanew + 4) != Some(b"PE\0\0".as_slice()) {
+        return Err(MetadataError::NoPeSignature);
+    }
+
+    // Parse COFF header
+    let coff_offset = e_lfanew + 4;
+    let size_of_optional_header =
+        u16::from_le_bytes([pe_data[coff_offset + 16], pe_data[coff_offset + 17]]) as usize;
+
+    if size_of_optional_header == 0 {
+        return Err(MetadataError::NoOptionalHeader);
+    }
+
+    // Parse optional header to find CLI header data directory
+    let opt_offset = coff_offset + 20;
+    let magic = u16::from_le_bytes([pe_data[opt_offset], pe_data[opt_offset + 1]]);
+
+    // PE32 = 0x10b, PE32+ = 0x20b
+    let is_pe32_plus = magic == 0x20b;
+    let data_dir_offset = if is_pe32_plus {
+        opt_offset + 112
+    } else {
+        opt_offset + 96
+    };
+
+    // CLI header is data directory entry 14 (COM Descriptor)
+    let cli_dir_offset = data_dir_offset + 14 * 8;
+    if cli_dir_offset + 8 > pe_data.len() {
+        return Err(MetadataError::NoCliHeader);
+    }
+
+    let cli_rva = u32::from_le_bytes([
+        pe_data[cli_dir_offset],
+        pe_data[cli_dir_offset + 1],
+        pe_data[cli_dir_offset + 2],
+        pe_data[cli_dir_offset + 3],
+    ]);
+
+    if cli_rva == 0 {
+        return Err(MetadataError::NoCliHeader);
+    }
+
+    // Convert RVA to file offset using section headers
+    let cli_offset = rva_to_file_offset(pe_data, e_lfanew, cli_rva as usize)
+        .ok_or(MetadataError::CliOffsetInvalid)?;
+
+    // Parse CLI header - we need metadata RVA at offset 8
+    if cli_offset + 16 > pe_data.len() {
+        return Err(MetadataError::CliOffsetInvalid);
+    }
+
+    let metadata_rva = u32::from_le_bytes([
+        pe_data[cli_offset + 8],
+        pe_data[cli_offset + 9],
+        pe_data[cli_offset + 10],
+        pe_data[cli_offset + 11],
+    ]) as usize;
+
+    let metadata_size = u32::from_le_bytes([
+        pe_data[cli_offset + 12],
+        pe_data[cli_offset + 13],
+        pe_data[cli_offset + 14],
+        pe_data[cli_offset + 15],
+    ]) as usize;
+
+    if metadata_rva == 0 || metadata_size == 0 {
+        return Err(MetadataError::NoMetadata);
+    }
+
+    let metadata_offset = rva_to_file_offset(pe_data, e_lfanew, metadata_rva)
+        .ok_or(MetadataError::MetadataOffsetInvalid)?;
+
+    if metadata_offset + metadata_size > pe_data.len() {
+        return Err(MetadataError::MetadataOffsetInvalid);
+    }
+
+    let metadata = &pe_data[metadata_offset..metadata_offset + metadata_size];
+
+    // Parse metadata root - check BSJB signature
+    if metadata.len() < 16 || metadata[0..4] != [0x42, 0x53, 0x4A, 0x42] {
+        return Err(MetadataError::NoBsjbSignature);
+    }
+
+    // Continue with the rest of parsing (simplified - just check we can find streams)
+    let version_length =
+        u32::from_le_bytes([metadata[12], metadata[13], metadata[14], metadata[15]]) as usize;
+    let version_padded = (version_length + 3) & !3;
+    let streams_offset = 16 + version_padded;
+
+    if streams_offset + 4 > metadata.len() {
+        return Err(MetadataError::StreamParseError);
+    }
+
+    // Use the full extraction logic
+    extract_assembly_name_from_metadata(pe_data).ok_or(MetadataError::NoAssemblyTable)
+}
+
 /// Extract the assembly name from .NET metadata in a PE file.
 /// This reads the Assembly table from the #~ stream and looks up the name in #Strings.
 /// Returns None if the file is not a .NET assembly or metadata is corrupted.
@@ -569,12 +799,8 @@ pub fn extract_assembly_name_from_metadata(pe_data: &[u8]) -> Option<String> {
         return None;
     }
 
-    let e_lfanew = u32::from_le_bytes([
-        pe_data[0x3C],
-        pe_data[0x3D],
-        pe_data[0x3E],
-        pe_data[0x3F],
-    ]) as usize;
+    let e_lfanew =
+        u32::from_le_bytes([pe_data[0x3C], pe_data[0x3D], pe_data[0x3E], pe_data[0x3F]]) as usize;
 
     if e_lfanew + 24 > pe_data.len() {
         return None;
@@ -690,9 +916,12 @@ pub fn extract_assembly_name_from_metadata(pe_data: &[u8]) -> Option<String> {
             break;
         }
 
-        let stream_offset =
-            u32::from_le_bytes([metadata[pos], metadata[pos + 1], metadata[pos + 2], metadata[pos + 3]])
-                as usize;
+        let stream_offset = u32::from_le_bytes([
+            metadata[pos],
+            metadata[pos + 1],
+            metadata[pos + 2],
+            metadata[pos + 3],
+        ]) as usize;
         let stream_size = u32::from_le_bytes([
             metadata[pos + 4],
             metadata[pos + 5],
@@ -847,7 +1076,10 @@ fn extract_assembly_name_from_tilde_stream(tilde: &[u8], strings: &[u8]) -> Opti
     }
 
     let name_bytes = &strings[name_index..];
-    let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+    let end = name_bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(name_bytes.len());
     let name = std::str::from_utf8(&name_bytes[..end]).ok()?;
 
     if name.is_empty() {
@@ -931,7 +1163,9 @@ fn get_table_row_size(
         // 0x04: Field - Flags(2) + Name(S) + Signature(B)
         0x04 => 2 + string_idx_size + blob_idx_size,
         // 0x06: MethodDef - RVA(4) + ImplFlags(2) + Flags(2) + Name(S) + Signature(B) + ParamList(idx)
-        0x06 => 4 + 2 + 2 + string_idx_size + blob_idx_size + simple_idx_size(row_counts, valid, 0x08),
+        0x06 => {
+            4 + 2 + 2 + string_idx_size + blob_idx_size + simple_idx_size(row_counts, valid, 0x08)
+        }
         // 0x08: Param - Flags(2) + Sequence(2) + Name(S)
         0x08 => 2 + 2 + string_idx_size,
         // 0x09: InterfaceImpl - Class(idx to TypeDef) + Interface(coded)
@@ -963,7 +1197,9 @@ fn get_table_row_size(
         // 0x18: MethodSemantics - Semantics(2) + Method(idx to MethodDef) + Association(coded)
         0x18 => 2 + simple_idx_size(row_counts, valid, 0x06) + has_semantics(),
         // 0x19: MethodImpl - Class(idx to TypeDef) + MethodBody(coded) + MethodDeclaration(coded)
-        0x19 => simple_idx_size(row_counts, valid, 0x02) + method_def_or_ref() + method_def_or_ref(),
+        0x19 => {
+            simple_idx_size(row_counts, valid, 0x02) + method_def_or_ref() + method_def_or_ref()
+        }
         // 0x1A: ModuleRef - Name(S)
         0x1A => string_idx_size,
         // 0x1B: TypeSpec - Signature(B)
@@ -989,11 +1225,7 @@ fn simple_idx_size(row_counts: &[u32], valid: u64, table: usize) -> usize {
     }
     let idx = count_bits_before(valid, table);
     let count = row_counts.get(idx).copied().unwrap_or(0);
-    if count < 0x10000 {
-        2
-    } else {
-        4
-    }
+    if count < 0x10000 { 2 } else { 4 }
 }
 
 /// Convert an RVA to a file offset using section headers.
@@ -1039,9 +1271,5 @@ fn rva_to_file_offset(pe_data: &[u8], e_lfanew: usize, rva: usize) -> Option<usi
     }
 
     // If not in any section, assume it's in the header (RVA == file offset)
-    if rva < 0x1000 {
-        Some(rva)
-    } else {
-        None
-    }
+    if rva < 0x1000 { Some(rva) } else { None }
 }
