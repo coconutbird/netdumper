@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::Win32::Foundation::{CloseHandle, E_FAIL, E_NOINTERFACE, E_NOTIMPL, HANDLE, S_OK};
@@ -44,7 +44,7 @@ const IMAGE_FILE_MACHINE_CURRENT: u16 = 0x014c; // I386
 const IMAGE_FILE_MACHINE_CURRENT: u16 = 0xAA64; // ARM64
 
 // GUID for ICLRDataTarget interface
-const IID_ICLR_DATA_TARGET: GUID = GUID::from_u128(0x3E11CCEE_D08B_43e5_AF01_32717A64DA03);
+const IID_ICLR_DATA_TARGET: GUID = GUID::from_u128(0x3E11CCEE_D08B_43E5_AF01_32717A64DA03);
 
 /// CLRDataCreateInstance function type (exported by DAC DLLs)
 type CLRDataCreateInstanceFn = unsafe extern "system" fn(
@@ -118,6 +118,132 @@ struct ICLRDataTargetImpl {
 }
 
 // =============================================================================
+// Process Handle RAII Wrapper
+// =============================================================================
+
+/// RAII wrapper for Windows process handles.
+/// Automatically closes the handle when dropped.
+struct ProcessHandle(HANDLE);
+
+impl ProcessHandle {
+    /// Open a process with query and read permissions.
+    fn open(pid: u32) -> Result<Self> {
+        let handle =
+            unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }
+                .map_err(|e| Error::Other(format!("Failed to open process {}: {}", pid, e)))?;
+        Ok(Self(handle))
+    }
+
+    /// Get the raw handle for Windows API calls.
+    fn as_raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0).ok() };
+    }
+}
+
+// =============================================================================
+// Process Information Cache
+// =============================================================================
+
+/// Cached information about a target process.
+/// Consolidates process inspection to avoid repeated handle opens and module enumeration.
+pub struct ProcessInfo {
+    handle: ProcessHandle,
+    /// Map of module name (lowercase) -> base address
+    module_bases: HashMap<String, u64>,
+    /// Main executable base address
+    exe_base_address: u64,
+    /// Path to the main executable (currently unused, reserved for future use)
+    #[allow(dead_code)]
+    exe_path: Option<PathBuf>,
+    /// Whether this process has an embedded CLR (single-file deployment)
+    is_embedded_clr: bool,
+    /// Cached embedded CLR info (if applicable)
+    embedded_clr_info: Option<EmbeddedRuntimeInfo>,
+}
+
+impl ProcessInfo {
+    /// Create a new ProcessInfo by inspecting the target process.
+    pub fn new(pid: u32) -> Result<Self> {
+        let handle = ProcessHandle::open(pid)?;
+
+        // Enumerate all modules
+        let mut modules = [windows::Win32::Foundation::HMODULE::default(); 1024];
+        let mut needed = 0u32;
+
+        unsafe {
+            EnumProcessModulesEx(
+                handle.as_raw(),
+                modules.as_mut_ptr(),
+                std::mem::size_of_val(&modules) as u32,
+                &mut needed,
+                LIST_MODULES_ALL,
+            )
+        }
+        .map_err(|e| Error::Other(format!("EnumProcessModulesEx failed: {}", e)))?;
+
+        let count = needed as usize / std::mem::size_of::<windows::Win32::Foundation::HMODULE>();
+
+        // Build module map
+        let mut module_bases = HashMap::new();
+        for i in 0..count {
+            let module = modules[i];
+            let mut name_buf = [0u16; 260];
+            let len = unsafe { GetModuleBaseNameW(handle.as_raw(), Some(module), &mut name_buf) };
+            if len > 0 {
+                let name = String::from_utf16_lossy(&name_buf[..len as usize]).to_lowercase();
+                module_bases.insert(name, module.0 as u64);
+            }
+        }
+
+        // Get main EXE base address and path
+        let exe_base_address = if count > 0 { modules[0].0 as u64 } else { 0 };
+
+        let exe_path = if count > 0 {
+            let mut path_buf = [0u16; 512];
+            let path_len = unsafe {
+                GetModuleFileNameExW(Some(handle.as_raw()), Some(modules[0]), &mut path_buf)
+            };
+            if path_len > 0 {
+                Some(PathBuf::from(String::from_utf16_lossy(
+                    &path_buf[..path_len as usize],
+                )))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Check if this is an embedded CLR process
+        let has_coreclr_module = module_bases.contains_key("coreclr.dll");
+        let has_clr_exports = exe_path.as_ref().is_some_and(exe_has_clr_exports);
+        let is_embedded_clr = !has_coreclr_module && has_clr_exports;
+
+        // Get embedded CLR info if applicable
+        let embedded_clr_info = if is_embedded_clr {
+            get_embedded_clr_version_with_handle(handle.as_raw())
+        } else {
+            None
+        };
+
+        Ok(Self {
+            handle,
+            module_bases,
+            exe_base_address,
+            exe_path,
+            is_embedded_clr,
+            embedded_clr_info,
+        })
+    }
+}
+
+// =============================================================================
 // CLRDataTarget - unified ICLRDataTarget using ReadProcessMemory
 // =============================================================================
 
@@ -157,19 +283,22 @@ static CLR_DATA_TARGET_VTBL: ICLRDataTargetVtbl = ICLRDataTargetVtbl {
 impl CLRDataTarget {
     /// Create a new CLRDataTarget for an external process (opens handle).
     fn new_external(pid: u32) -> Result<*mut ICLRDataTargetImpl> {
-        let handle =
-            unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }
-                .map_err(|e| Error::Other(format!("Failed to open process: {}", e)))?;
+        let info = ProcessInfo::new(pid)?;
+        Self::from_process_info(info)
+    }
 
-        let module_bases = enumerate_module_bases(handle)?;
+    /// Create a new CLRDataTarget from an existing ProcessInfo.
+    /// Note: This takes ownership of the ProcessInfo's handle.
+    fn from_process_info(info: ProcessInfo) -> Result<*mut ICLRDataTargetImpl> {
+        // Extract the raw handle before ProcessInfo is consumed
+        // We need to prevent ProcessInfo from closing the handle
+        let handle = info.handle.0;
+        let module_bases = info.module_bases;
+        let exe_base_address = info.exe_base_address;
+        let is_embedded_clr = info.is_embedded_clr;
 
-        // Get the main EXE base address (first module is always the EXE)
-        let exe_base_address = get_main_exe_base(handle).unwrap_or(0);
-
-        // Check if this is an embedded CLR process by looking for coreclr.dll
-        // If coreclr.dll is NOT in module_bases, it might be embedded in the EXE
-        let has_coreclr_module = module_bases.contains_key("coreclr.dll");
-        let is_embedded_clr = !has_coreclr_module && exe_base_address != 0;
+        // Prevent ProcessInfo's Drop from closing the handle
+        std::mem::forget(info.handle);
 
         let target = Box::new(CLRDataTarget {
             vtbl: &CLR_DATA_TARGET_VTBL,
@@ -183,61 +312,6 @@ impl CLRDataTarget {
 
         Ok(Box::into_raw(target) as *mut ICLRDataTargetImpl)
     }
-}
-
-/// Get the main executable's base address
-fn get_main_exe_base(handle: HANDLE) -> Option<u64> {
-    let mut modules = [windows::Win32::Foundation::HMODULE::default(); 1];
-    let mut needed = 0u32;
-
-    let result = unsafe {
-        EnumProcessModulesEx(
-            handle,
-            modules.as_mut_ptr(),
-            std::mem::size_of_val(&modules) as u32,
-            &mut needed,
-            LIST_MODULES_ALL,
-        )
-    };
-
-    if result.is_ok() && needed >= std::mem::size_of::<windows::Win32::Foundation::HMODULE>() as u32
-    {
-        Some(modules[0].0 as u64)
-    } else {
-        None
-    }
-}
-
-/// Enumerate all modules in a process and return a map of name -> base address
-fn enumerate_module_bases(handle: HANDLE) -> Result<HashMap<String, u64>> {
-    let mut modules = [windows::Win32::Foundation::HMODULE::default(); 1024];
-    let mut needed = 0u32;
-
-    unsafe {
-        EnumProcessModulesEx(
-            handle,
-            modules.as_mut_ptr(),
-            std::mem::size_of_val(&modules) as u32,
-            &mut needed,
-            LIST_MODULES_ALL,
-        )
-    }
-    .map_err(|e| Error::Other(format!("EnumProcessModulesEx failed: {}", e)))?;
-
-    let count = needed as usize / std::mem::size_of::<windows::Win32::Foundation::HMODULE>();
-    let mut map = HashMap::new();
-
-    for i in 0..count {
-        let module = modules[i];
-        let mut name_buf = [0u16; 260];
-        let len = unsafe { GetModuleBaseNameW(handle, Some(module), &mut name_buf) };
-        if len > 0 {
-            let name = String::from_utf16_lossy(&name_buf[..len as usize]).to_lowercase();
-            map.insert(name, module.0 as u64);
-        }
-    }
-
-    Ok(map)
 }
 
 // IUnknown implementation
@@ -930,62 +1004,22 @@ fn check_pe_has_clr_header(path: &PathBuf) -> bool {
 
 /// Enumerate assemblies from an external process using DAC
 pub fn enumerate_assemblies_external(pid: u32) -> Result<Vec<AssemblyInfo>> {
-    // Find the runtime directory
-    let runtime_info = find_runtime_directory_by_pid(pid)?
-        .ok_or_else(|| Error::Other("Could not find .NET runtime in target process".into()))?;
+    // Create ProcessInfo once - this caches all process information
+    let process_info = ProcessInfo::new(pid)?;
 
     // Check if this is an embedded CLR (single-file app)
     // In that case, we may need to try multiple DAC versions
-    let is_embedded_clr = is_embedded_clr_process(pid);
-
-    if is_embedded_clr {
+    if process_info.is_embedded_clr {
         // Try multiple DAC versions, starting from highest
-        return enumerate_with_multiple_dacs(pid);
+        return enumerate_with_multiple_dacs(process_info);
     }
+
+    // Find the runtime directory for standard CLR
+    let runtime_info = find_runtime_directory_by_pid(pid)?
+        .ok_or_else(|| Error::Other("Could not find .NET runtime in target process".into()))?;
 
     // Standard case: use the DAC from the same directory as the CLR
-    try_enumerate_with_dac_path(pid, &runtime_info.dac_path())
-}
-
-/// Check if a process has an embedded CLR (single-file deployment)
-fn is_embedded_clr_process(pid: u32) -> bool {
-    let handle =
-        match unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) } {
-            Ok(h) => h,
-            Err(_) => return false,
-        };
-
-    let mut modules = [windows::Win32::Foundation::HMODULE::default(); 1];
-    let mut needed = 0u32;
-
-    let result = unsafe {
-        EnumProcessModulesEx(
-            handle,
-            modules.as_mut_ptr(),
-            std::mem::size_of_val(&modules) as u32,
-            &mut needed,
-            LIST_MODULES_ALL,
-        )
-    };
-
-    if result.is_err() {
-        unsafe { CloseHandle(handle).ok() };
-        return false;
-    }
-
-    // Get main executable path
-    let mut path_buf = [0u16; 512];
-    let path_len = unsafe { GetModuleFileNameExW(Some(handle), Some(modules[0]), &mut path_buf) };
-    unsafe { CloseHandle(handle).ok() };
-
-    if path_len == 0 {
-        return false;
-    }
-
-    let full_path = String::from_utf16_lossy(&path_buf[..path_len as usize]);
-    let exe_path = PathBuf::from(full_path);
-
-    exe_has_clr_exports(&exe_path)
+    try_enumerate_with_dac_path(process_info, &runtime_info.dac_path())
 }
 
 /// RuntimeInfo structure from embedded CLR (matches dotnet/runtime runtimeinfo.h)
@@ -1471,9 +1505,22 @@ fn find_best_matching_dac(major: i32, minor: i32, build: i32) -> Option<PathBuf>
 }
 
 /// Try to enumerate assemblies using multiple DAC versions
-fn enumerate_with_multiple_dacs(pid: u32) -> Result<Vec<AssemblyInfo>> {
-    // First, try to read the embedded CLR version from the target process
-    let embedded_info = get_embedded_clr_version(pid);
+/// Takes a ProcessInfo to avoid re-opening handles for embedded CLR detection.
+fn enumerate_with_multiple_dacs(process_info: ProcessInfo) -> Result<Vec<AssemblyInfo>> {
+    // Use the cached embedded CLR info from ProcessInfo
+    let embedded_info = process_info.embedded_clr_info;
+
+    // We need to consume the ProcessInfo for the first DAC attempt
+    // But we might need to try multiple DACs, so we need to track the pid
+    // and create new ProcessInfo for each subsequent attempt
+    let pid = {
+        // Get pid from handle - we need to extract it before consuming process_info
+        // Unfortunately Windows doesn't have a clean way to get PID from handle without QueryFullProcessImageName
+        // So we'll capture the pid before the first attempt by using GetProcessId
+        unsafe {
+            windows::Win32::System::Threading::GetProcessId(process_info.handle.as_raw())
+        }
+    };
 
     if let Some(ref info) = embedded_info {
         eprintln!(
@@ -1489,13 +1536,22 @@ fn enumerate_with_multiple_dacs(pid: u32) -> Result<Vec<AssemblyInfo>> {
         {
             eprintln!("Using matching DAC: {}", matching_dac.display());
 
-            match try_enumerate_with_dac_path(pid, &matching_dac) {
+            // Use the provided ProcessInfo for the first attempt
+            match try_enumerate_with_dac_path_and_info(process_info, &matching_dac) {
                 Ok(assemblies) => return Ok(assemblies),
                 Err(e) => {
                     eprintln!("Matching DAC failed: {}. Trying other versions...", e);
                 }
             }
+
+            // After first attempt, process_info is consumed. Create new ones for subsequent attempts.
+        } else {
+            // No matching DAC found, drop process_info and continue with pid-based attempts
+            drop(process_info);
         }
+    } else {
+        // No embedded info, drop process_info and continue with pid-based attempts
+        drop(process_info);
     }
 
     // Fall back to trying all available local DAC versions
@@ -1516,7 +1572,7 @@ fn enumerate_with_multiple_dacs(pid: u32) -> Result<Vec<AssemblyInfo>> {
 
         eprintln!("Trying DAC version {}...", version);
 
-        match try_enumerate_with_dac_path(pid, &dac_path) {
+        match try_enumerate_with_dac_path_by_pid(pid, &dac_path) {
             Ok(assemblies) => {
                 eprintln!("Success with DAC version {}", version);
                 return Ok(assemblies);
@@ -1540,7 +1596,7 @@ fn enumerate_with_multiple_dacs(pid: u32) -> Result<Vec<AssemblyInfo>> {
             match download_dac_from_symbol_server(&dac_index) {
                 Ok(dac_path) => {
                     eprintln!("Downloaded DAC, attempting to use: {}", dac_path.display());
-                    match try_enumerate_with_dac_path(pid, &dac_path) {
+                    match try_enumerate_with_dac_path_by_pid(pid, &dac_path) {
                         Ok(assemblies) => {
                             eprintln!("Success with downloaded DAC!");
                             return Ok(assemblies);
@@ -1571,8 +1627,32 @@ fn enumerate_with_multiple_dacs(pid: u32) -> Result<Vec<AssemblyInfo>> {
     )))
 }
 
-/// Try to enumerate assemblies using a specific DAC path
-fn try_enumerate_with_dac_path(pid: u32, dac_path: &PathBuf) -> Result<Vec<AssemblyInfo>> {
+/// Try to enumerate assemblies using a specific DAC path and an existing ProcessInfo.
+/// This consumes the ProcessInfo.
+fn try_enumerate_with_dac_path_and_info(
+    process_info: ProcessInfo,
+    dac_path: &Path,
+) -> Result<Vec<AssemblyInfo>> {
+    let create_instance = load_dac_create_instance(dac_path)?;
+    let data_target = CLRDataTarget::from_process_info(process_info)?;
+    enumerate_with_dac(create_instance, data_target)
+}
+
+/// Try to enumerate assemblies using a specific DAC path by opening a new process handle.
+fn try_enumerate_with_dac_path_by_pid(pid: u32, dac_path: &Path) -> Result<Vec<AssemblyInfo>> {
+    let create_instance = load_dac_create_instance(dac_path)?;
+    let data_target = CLRDataTarget::new_external(pid)?;
+    enumerate_with_dac(create_instance, data_target)
+}
+
+/// Try to enumerate assemblies using a specific DAC path.
+/// Convenience wrapper that creates ProcessInfo internally.
+fn try_enumerate_with_dac_path(process_info: ProcessInfo, dac_path: &Path) -> Result<Vec<AssemblyInfo>> {
+    try_enumerate_with_dac_path_and_info(process_info, dac_path)
+}
+
+/// Load the DAC DLL and get the CLRDataCreateInstance function pointer.
+fn load_dac_create_instance(dac_path: &Path) -> Result<CLRDataCreateInstanceFn> {
     if !dac_path.exists() {
         return Err(Error::Other(format!(
             "DAC not found at {}",
@@ -1593,16 +1673,12 @@ fn try_enumerate_with_dac_path(pid: u32, dac_path: &PathBuf) -> Result<Vec<Assem
     let create_instance: CLRDataCreateInstanceFn = unsafe {
         let proc = GetProcAddress(dac_module, windows::core::s!("CLRDataCreateInstance"));
         match proc {
-            Some(p) => std::mem::transmute(p),
+            Some(p) => std::mem::transmute::<_, CLRDataCreateInstanceFn>(p),
             None => return Err(Error::Other("CLRDataCreateInstance not found".into())),
         }
     };
 
-    // Create our external data target
-    let data_target = CLRDataTarget::new_external(pid)?;
-
-    // Create IXCLRDataProcess and enumerate
-    enumerate_with_dac(create_instance, data_target)
+    Ok(create_instance)
 }
 
 /// Common enumeration logic using DAC
