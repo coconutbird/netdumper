@@ -752,8 +752,9 @@ fn extract_assembly_name_from_tilde_stream(tilde: &[u8], strings: &[u8]) -> Opti
     }
 
     let heap_sizes = tilde[6];
-    let string_index_size = if heap_sizes & 0x01 != 0 { 4 } else { 2 };
-    let blob_index_size = if heap_sizes & 0x04 != 0 { 4 } else { 2 };
+    let string_idx_size = if heap_sizes & 0x01 != 0 { 4 } else { 2 };
+    let guid_idx_size = if heap_sizes & 0x02 != 0 { 4 } else { 2 };
+    let blob_idx_size = if heap_sizes & 0x04 != 0 { 4 } else { 2 };
 
     let valid = u64::from_le_bytes([
         tilde[8], tilde[9], tilde[10], tilde[11], tilde[12], tilde[13], tilde[14], tilde[15],
@@ -793,7 +794,14 @@ fn extract_assembly_name_from_tilde_stream(tilde: &[u8], strings: &[u8]) -> Opti
                 break;
             }
             // Calculate row size for this table
-            let row_size = get_table_row_size(i, &row_counts, valid, string_index_size, blob_index_size);
+            let row_size = get_table_row_size(
+                i,
+                &row_counts,
+                valid,
+                string_idx_size,
+                guid_idx_size,
+                blob_idx_size,
+            );
             let table_index = count_bits_before(valid, i);
             let row_count = *row_counts.get(table_index)? as usize;
             current_offset += row_size * row_count;
@@ -804,7 +812,7 @@ fn extract_assembly_name_from_tilde_stream(tilde: &[u8], strings: &[u8]) -> Opti
         return None;
     }
 
-    // Assembly table row format:
+    // Assembly table row format (ECMA-335 II.22.2):
     // HashAlgId: u32
     // MajorVersion: u16
     // MinorVersion: u16
@@ -815,14 +823,14 @@ fn extract_assembly_name_from_tilde_stream(tilde: &[u8], strings: &[u8]) -> Opti
     // Name: String index
     // Culture: String index
 
-    let name_offset_in_row = 4 + 2 + 2 + 2 + 2 + 4 + blob_index_size;
+    let name_offset_in_row = 4 + 2 + 2 + 2 + 2 + 4 + blob_idx_size;
     let name_pos = assembly_table_offset + name_offset_in_row;
 
-    if name_pos + string_index_size > tilde.len() {
+    if name_pos + string_idx_size > tilde.len() {
         return None;
     }
 
-    let name_index = if string_index_size == 4 {
+    let name_index = if string_idx_size == 4 {
         u32::from_le_bytes([
             tilde[name_pos],
             tilde[name_pos + 1],
@@ -856,21 +864,16 @@ fn count_bits_before(valid: u64, bit: usize) -> usize {
 }
 
 /// Get the row size for a metadata table.
-/// This is a simplified version - we only need accurate sizes for tables before Assembly (0x20).
+/// Reference: ECMA-335 II.22
 fn get_table_row_size(
     table: usize,
     row_counts: &[u32],
     valid: u64,
     string_idx_size: usize,
+    guid_idx_size: usize,
     blob_idx_size: usize,
 ) -> usize {
-    // Simplified table row sizes - we only need tables 0x00 to 0x1F
-    // For a complete implementation, each table has specific column definitions
-    // Reference: ECMA-335 II.22
-
-    let guid_idx_size = 2usize; // Simplified - could be 4 if #GUID is large
-
-    // Helper to get coded index size
+    // Helper to get coded index size based on tag bits and referenced tables
     let coded_idx_size = |tag_bits: usize, tables: &[usize]| -> usize {
         let max_rows = tables
             .iter()
@@ -891,46 +894,91 @@ fn get_table_row_size(
         }
     };
 
+    // Coded index definitions from ECMA-335 II.24.2.6
+    let type_def_or_ref = || coded_idx_size(2, &[0x02, 0x01, 0x1B]); // TypeDef, TypeRef, TypeSpec
+    let has_constant = || coded_idx_size(2, &[0x04, 0x08, 0x17]); // Field, Param, Property
+    let has_custom_attribute = || {
+        coded_idx_size(
+            5,
+            &[
+                0x06, 0x04, 0x01, 0x02, 0x08, 0x09, 0x0A, 0x00, 0x0E, 0x17, 0x14, 0x11, 0x1A, 0x1B,
+                0x20, 0x23, 0x26, 0x27, 0x28, 0x2A, 0x2C,
+            ],
+        )
+    };
+    let has_field_marshal = || coded_idx_size(1, &[0x04, 0x08]); // Field, Param
+    let has_decl_security = || coded_idx_size(2, &[0x02, 0x06, 0x20]); // TypeDef, MethodDef, Assembly
+    let member_ref_parent = || coded_idx_size(3, &[0x02, 0x01, 0x1A, 0x06, 0x1B]); // TypeDef, TypeRef, ModuleRef, MethodDef, TypeSpec
+    let has_semantics = || coded_idx_size(1, &[0x14, 0x17]); // Event, Property
+    let method_def_or_ref = || coded_idx_size(1, &[0x06, 0x0A]); // MethodDef, MemberRef
+    let member_forwarded = || coded_idx_size(1, &[0x04, 0x06]); // Field, MethodDef
+    let _implementation = || coded_idx_size(2, &[0x26, 0x23, 0x27]); // File, AssemblyRef, ExportedType
+    let custom_attribute_type = || coded_idx_size(3, &[0x06, 0x0A]); // MethodDef, MemberRef (only 2 used, but 3 bits)
+    let resolution_scope = || coded_idx_size(2, &[0x00, 0x1A, 0x23, 0x01]); // Module, ModuleRef, AssemblyRef, TypeRef
+
     match table {
-        0x00 => 4 + string_idx_size * 2 + guid_idx_size * 3, // Module
-        0x01 => coded_idx_size(2, &[0x00, 0x1A, 0x23, 0x01]) + string_idx_size * 2, // TypeRef
+        // 0x00: Module - Generation(2) + Name(S) + Mvid(G) + EncId(G) + EncBaseId(G)
+        0x00 => 2 + string_idx_size + guid_idx_size * 3,
+        // 0x01: TypeRef - ResolutionScope(coded) + TypeName(S) + TypeNamespace(S)
+        0x01 => resolution_scope() + string_idx_size * 2,
+        // 0x02: TypeDef - Flags(4) + TypeName(S) + TypeNamespace(S) + Extends(coded) + FieldList(idx) + MethodList(idx)
         0x02 => {
-            // TypeDef
             4 + string_idx_size * 2
-                + coded_idx_size(3, &[0x01, 0x02, 0x1B])
+                + type_def_or_ref()
                 + simple_idx_size(row_counts, valid, 0x04)
                 + simple_idx_size(row_counts, valid, 0x06)
         }
-        0x04 => 2 + string_idx_size + blob_idx_size, // Field
-        0x06 => {
-            // MethodDef
-            4 + 2 + 2 + string_idx_size + blob_idx_size + simple_idx_size(row_counts, valid, 0x08)
-        }
-        0x08 => 2 + string_idx_size + blob_idx_size, // Param
-        0x09 => {
-            // InterfaceImpl
-            simple_idx_size(row_counts, valid, 0x02) + coded_idx_size(3, &[0x01, 0x02, 0x1B])
-        }
-        0x0A => coded_idx_size(3, &[0x01, 0x02, 0x1B]) + string_idx_size + blob_idx_size, // MemberRef
-        0x0B => coded_idx_size(5, &[0x00, 0x01, 0x02, 0x04, 0x06, 0x08, 0x09, 0x0A, 0x0E, 0x11, 0x14, 0x17, 0x20, 0x23, 0x26, 0x27, 0x28]) + coded_idx_size(2, &[0x04, 0x06, 0x00, 0x00]) + blob_idx_size, // Constant
-        0x0C => coded_idx_size(5, &[0x00, 0x01, 0x02, 0x04, 0x06, 0x08, 0x09, 0x0A, 0x0E, 0x11, 0x14, 0x17, 0x20, 0x23, 0x26, 0x27, 0x28]) + coded_idx_size(3, &[0x00, 0x00, 0x0A, 0x00]) + blob_idx_size, // CustomAttribute
-        0x0D => coded_idx_size(1, &[0x04, 0x08]) + blob_idx_size, // FieldMarshal
-        0x0E => 2 + blob_idx_size,                   // DeclSecurity
-        0x0F => 2 + 4 + 4 + simple_idx_size(row_counts, valid, 0x02), // ClassLayout
-        0x10 => 4 + simple_idx_size(row_counts, valid, 0x04), // FieldLayout
-        0x11 => blob_idx_size,                       // StandAloneSig
-        0x12 => simple_idx_size(row_counts, valid, 0x02) + simple_idx_size(row_counts, valid, 0x04), // EventMap
-        0x14 => 2 + string_idx_size + coded_idx_size(3, &[0x01, 0x02, 0x1B]), // Event
-        0x15 => simple_idx_size(row_counts, valid, 0x02) + simple_idx_size(row_counts, valid, 0x17), // PropertyMap
-        0x17 => 2 + string_idx_size + blob_idx_size, // Property
-        0x18 => 2 + coded_idx_size(1, &[0x06, 0x0A]) + coded_idx_size(5, &[0x00, 0x01, 0x02, 0x04, 0x06, 0x08, 0x09, 0x0A, 0x0E, 0x11, 0x14, 0x17, 0x20, 0x23, 0x26, 0x27, 0x28]), // MethodSemantics
-        0x19 => simple_idx_size(row_counts, valid, 0x02) + coded_idx_size(2, &[0x02, 0x1B]) + simple_idx_size(row_counts, valid, 0x06), // MethodImpl
-        0x1A => string_idx_size,                     // ModuleRef
-        0x1B => blob_idx_size,                       // TypeSpec
-        0x1C => 2 + coded_idx_size(3, &[0x01, 0x02, 0x1B]) + string_idx_size + string_idx_size, // ImplMap
-        0x1D => 4 + simple_idx_size(row_counts, valid, 0x04), // FieldRVA
-        0x20 => 4 + 2 + 2 + 2 + 2 + 4 + blob_idx_size + string_idx_size * 2, // Assembly
-        _ => 0, // We don't need tables after Assembly
+        // 0x04: Field - Flags(2) + Name(S) + Signature(B)
+        0x04 => 2 + string_idx_size + blob_idx_size,
+        // 0x06: MethodDef - RVA(4) + ImplFlags(2) + Flags(2) + Name(S) + Signature(B) + ParamList(idx)
+        0x06 => 4 + 2 + 2 + string_idx_size + blob_idx_size + simple_idx_size(row_counts, valid, 0x08),
+        // 0x08: Param - Flags(2) + Sequence(2) + Name(S)
+        0x08 => 2 + 2 + string_idx_size,
+        // 0x09: InterfaceImpl - Class(idx to TypeDef) + Interface(coded)
+        0x09 => simple_idx_size(row_counts, valid, 0x02) + type_def_or_ref(),
+        // 0x0A: MemberRef - Class(coded) + Name(S) + Signature(B)
+        0x0A => member_ref_parent() + string_idx_size + blob_idx_size,
+        // 0x0B: Constant - Type(2) + Parent(coded) + Value(B)
+        0x0B => 2 + has_constant() + blob_idx_size,
+        // 0x0C: CustomAttribute - Parent(coded) + Type(coded) + Value(B)
+        0x0C => has_custom_attribute() + custom_attribute_type() + blob_idx_size,
+        // 0x0D: FieldMarshal - Parent(coded) + NativeType(B)
+        0x0D => has_field_marshal() + blob_idx_size,
+        // 0x0E: DeclSecurity - Action(2) + Parent(coded) + PermissionSet(B)
+        0x0E => 2 + has_decl_security() + blob_idx_size,
+        // 0x0F: ClassLayout - PackingSize(2) + ClassSize(4) + Parent(idx to TypeDef)
+        0x0F => 2 + 4 + simple_idx_size(row_counts, valid, 0x02),
+        // 0x10: FieldLayout - Offset(4) + Field(idx)
+        0x10 => 4 + simple_idx_size(row_counts, valid, 0x04),
+        // 0x11: StandAloneSig - Signature(B)
+        0x11 => blob_idx_size,
+        // 0x12: EventMap - Parent(idx to TypeDef) + EventList(idx to Event)
+        0x12 => simple_idx_size(row_counts, valid, 0x02) + simple_idx_size(row_counts, valid, 0x14),
+        // 0x14: Event - EventFlags(2) + Name(S) + EventType(coded)
+        0x14 => 2 + string_idx_size + type_def_or_ref(),
+        // 0x15: PropertyMap - Parent(idx to TypeDef) + PropertyList(idx to Property)
+        0x15 => simple_idx_size(row_counts, valid, 0x02) + simple_idx_size(row_counts, valid, 0x17),
+        // 0x17: Property - Flags(2) + Name(S) + Type(B)
+        0x17 => 2 + string_idx_size + blob_idx_size,
+        // 0x18: MethodSemantics - Semantics(2) + Method(idx to MethodDef) + Association(coded)
+        0x18 => 2 + simple_idx_size(row_counts, valid, 0x06) + has_semantics(),
+        // 0x19: MethodImpl - Class(idx to TypeDef) + MethodBody(coded) + MethodDeclaration(coded)
+        0x19 => simple_idx_size(row_counts, valid, 0x02) + method_def_or_ref() + method_def_or_ref(),
+        // 0x1A: ModuleRef - Name(S)
+        0x1A => string_idx_size,
+        // 0x1B: TypeSpec - Signature(B)
+        0x1B => blob_idx_size,
+        // 0x1C: ImplMap - MappingFlags(2) + MemberForwarded(coded) + ImportName(S) + ImportScope(idx to ModuleRef)
+        0x1C => 2 + member_forwarded() + string_idx_size + simple_idx_size(row_counts, valid, 0x1A),
+        // 0x1D: FieldRVA - RVA(4) + Field(idx)
+        0x1D => 4 + simple_idx_size(row_counts, valid, 0x04),
+        // 0x1E: EncLog - Token(4) + FuncCode(4)
+        0x1E => 4 + 4,
+        // 0x1F: EncMap - Token(4)
+        0x1F => 4,
+        // 0x20: Assembly - HashAlgId(4) + Major(2) + Minor(2) + Build(2) + Rev(2) + Flags(4) + PublicKey(B) + Name(S) + Culture(S)
+        0x20 => 4 + 2 + 2 + 2 + 2 + 4 + blob_idx_size + string_idx_size * 2,
+        _ => 0,
     }
 }
 
