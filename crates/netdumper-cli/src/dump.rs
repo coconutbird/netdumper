@@ -10,8 +10,9 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 
 use crate::pe::{
-    build_pe_from_metadata_with_il, build_pe_with_reconstructed_headers, convert_memory_to_file_layout,
-    extract_assembly_name_from_metadata_debug, extract_metadata_info, extract_method_rvas,
+    build_pe_from_metadata_with_il, build_pe_with_reconstructed_headers,
+    convert_memory_to_file_layout, extract_assembly_name_from_metadata_debug,
+    extract_entry_point_from_pe, extract_metadata_info, extract_method_rvas,
     is_pe_header_corrupted, read_pe_info, reconstruct_pe_info, validate_cli_header_in_memory,
 };
 use crate::process::{enumerate_assemblies_external, read_il_bodies_for_module};
@@ -124,7 +125,8 @@ pub fn dump_assembly(
     // This catches cases where ilBase doesn't point to a real PE image
     let cli_valid = validate_cli_header_in_memory(process_handle, assembly.base_address, &pe_info);
 
-    let file_image = if !cli_valid {
+    // Track if assembly has entry point (EXE vs DLL)
+    let (file_image, has_entry_point) = if !cli_valid {
         // CLI header is invalid - try to build PE from raw metadata
         if assembly.metadata_address == 0 || assembly.metadata_size == 0 {
             let safe_name = sanitize_filename(&fallback_name);
@@ -178,9 +180,13 @@ pub fn dump_assembly(
         }
 
         // Extract metadata info for logging
-        let (entry_point, _flags) = extract_metadata_info(&metadata);
+        let (meta_entry_point, _flags) = extract_metadata_info(&metadata);
         let method_rvas = extract_method_rvas(&metadata);
-        let rvas_only: Vec<u32> = method_rvas.iter().filter(|m| m.rva != 0).map(|m| m.rva).collect();
+        let rvas_only: Vec<u32> = method_rvas
+            .iter()
+            .filter(|m| m.rva != 0)
+            .map(|m| m.rva)
+            .collect();
         let methods_with_il = rvas_only.len();
 
         // Read IL bodies using DAC's GetILForModule
@@ -194,21 +200,29 @@ pub fn dump_assembly(
             Vec::new()
         };
 
-        if entry_point != 0 {
+        if meta_entry_point != 0 {
             eprintln!(
                 "  [INFO] {} - Reconstructing PE: entry point 0x{:08X}, {} methods with IL, {} IL bodies recovered",
-                fallback_name, entry_point, methods_with_il, il_bodies.len()
+                fallback_name,
+                meta_entry_point,
+                methods_with_il,
+                il_bodies.len()
             );
         } else {
             eprintln!(
                 "  [INFO] {} - Reconstructing PE: no entry point, {} methods with IL, {} IL bodies recovered",
-                fallback_name, methods_with_il, il_bodies.len()
+                fallback_name,
+                methods_with_il,
+                il_bodies.len()
             );
         }
 
         // Build PE from raw metadata with IL bodies
         let is_64bit = machine_type == 0x8664; // AMD64
-        build_pe_from_metadata_with_il(&metadata, &il_bodies, is_64bit)
+        (
+            build_pe_from_metadata_with_il(&metadata, &il_bodies, is_64bit),
+            meta_entry_point != 0,
+        )
     } else {
         // Normal path - read full PE image
         let image_size = pe_info.size_of_image as usize;
@@ -233,7 +247,7 @@ pub fn dump_assembly(
 
         let use_reconstruction = needs_reconstruction || is_pe_header_corrupted(&buffer);
 
-        if use_reconstruction {
+        let pe_data = if use_reconstruction {
             let reconstructed_info = if needs_reconstruction {
                 pe_info
             } else {
@@ -243,7 +257,12 @@ pub fn dump_assembly(
             build_pe_with_reconstructed_headers(&buffer, &reconstructed_info)
         } else {
             convert_memory_to_file_layout(&buffer, &pe_info)
-        }
+        };
+
+        // Check if the PE has an entry point by reading COR20 header
+        // Entry point token is at offset 20 in COR20 header (after Flags at 16)
+        let entry_point = extract_entry_point_from_pe(&pe_data);
+        (pe_data, entry_point != 0)
     };
 
     // Try to extract the real assembly name from .NET metadata
@@ -258,7 +277,9 @@ pub fn dump_assembly(
         }
     };
     let safe_name = sanitize_filename(&final_name);
-    let output_path = output_dir.join(format!("{}.dll", safe_name));
+    // Use .exe extension if assembly has entry point, .dll otherwise
+    let extension = if has_entry_point { "exe" } else { "dll" };
+    let output_path = output_dir.join(format!("{}.{}", safe_name, extension));
 
     match std::fs::write(&output_path, &file_image) {
         Ok(()) => DumpResult {

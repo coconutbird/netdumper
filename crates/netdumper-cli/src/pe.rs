@@ -283,6 +283,110 @@ pub fn validate_cli_header_in_memory(
     true
 }
 
+/// Extract entry point token from a PE file by reading the COR20 header.
+/// Returns the entry point token, or 0 if not found.
+pub fn extract_entry_point_from_pe(pe_data: &[u8]) -> u32 {
+    // Read e_lfanew from DOS header
+    if pe_data.len() < 0x40 {
+        return 0;
+    }
+    let e_lfanew = u32::from_le_bytes([pe_data[0x3C], pe_data[0x3D], pe_data[0x3E], pe_data[0x3F]]) as usize;
+
+    // Verify PE signature
+    if pe_data.len() < e_lfanew + 4 || &pe_data[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
+        return 0;
+    }
+
+    // COFF header starts at e_lfanew + 4
+    // SizeOfOptionalHeader at offset 16 from COFF header
+    let coff_offset = e_lfanew + 4;
+    if pe_data.len() < coff_offset + 20 {
+        return 0;
+    }
+    let size_of_optional_header =
+        u16::from_le_bytes([pe_data[coff_offset + 16], pe_data[coff_offset + 17]]) as usize;
+
+    // Optional header starts at coff_offset + 20
+    let opt_offset = coff_offset + 20;
+    if pe_data.len() < opt_offset + 2 {
+        return 0;
+    }
+    let magic = u16::from_le_bytes([pe_data[opt_offset], pe_data[opt_offset + 1]]);
+
+    // Data directories start after the standard/Windows-specific fields
+    // PE32 (0x10B): data dirs start at offset 96 from optional header
+    // PE32+ (0x20B): data dirs start at offset 112 from optional header
+    let data_dir_offset = match magic {
+        0x10B => opt_offset + 96,  // PE32
+        0x20B => opt_offset + 112, // PE32+
+        _ => return 0,
+    };
+
+    // CLR Runtime Header is data directory index 14
+    let clr_dir_offset = data_dir_offset + 14 * 8;
+    if pe_data.len() < clr_dir_offset + 8 {
+        return 0;
+    }
+    let clr_rva = u32::from_le_bytes([
+        pe_data[clr_dir_offset],
+        pe_data[clr_dir_offset + 1],
+        pe_data[clr_dir_offset + 2],
+        pe_data[clr_dir_offset + 3],
+    ]);
+
+    if clr_rva == 0 {
+        return 0;
+    }
+
+    // Convert RVA to file offset (simple: for our reconstructed PEs, .text is at 0x1000 and file offset 0x200)
+    // For real PEs, we'd need to walk section headers
+    let sections_offset = opt_offset + size_of_optional_header;
+    let num_sections = u16::from_le_bytes([pe_data[coff_offset + 2], pe_data[coff_offset + 3]]) as usize;
+
+    let mut clr_file_offset = 0usize;
+    for i in 0..num_sections {
+        let section_offset = sections_offset + i * 40;
+        if pe_data.len() < section_offset + 40 {
+            break;
+        }
+        let virt_addr = u32::from_le_bytes([
+            pe_data[section_offset + 12],
+            pe_data[section_offset + 13],
+            pe_data[section_offset + 14],
+            pe_data[section_offset + 15],
+        ]);
+        let virt_size = u32::from_le_bytes([
+            pe_data[section_offset + 8],
+            pe_data[section_offset + 9],
+            pe_data[section_offset + 10],
+            pe_data[section_offset + 11],
+        ]);
+        let raw_ptr = u32::from_le_bytes([
+            pe_data[section_offset + 20],
+            pe_data[section_offset + 21],
+            pe_data[section_offset + 22],
+            pe_data[section_offset + 23],
+        ]);
+
+        if clr_rva >= virt_addr && clr_rva < virt_addr + virt_size {
+            clr_file_offset = (raw_ptr + (clr_rva - virt_addr)) as usize;
+            break;
+        }
+    }
+
+    if clr_file_offset == 0 || pe_data.len() < clr_file_offset + 24 {
+        return 0;
+    }
+
+    // Entry point token is at offset 20 in COR20 header
+    u32::from_le_bytes([
+        pe_data[clr_file_offset + 20],
+        pe_data[clr_file_offset + 21],
+        pe_data[clr_file_offset + 22],
+        pe_data[clr_file_offset + 23],
+    ])
+}
+
 /// Extract entry point token and flags from raw metadata.
 /// Returns (entry_point_token, flags) where:
 /// - entry_point_token is the MethodDef token for Main() if found, or 0
@@ -312,9 +416,8 @@ fn find_entry_point_in_metadata(metadata: &[u8]) -> Option<u32> {
     }
 
     // Parse metadata header
-    let version_length = u32::from_le_bytes([
-        metadata[12], metadata[13], metadata[14], metadata[15],
-    ]) as usize;
+    let version_length =
+        u32::from_le_bytes([metadata[12], metadata[13], metadata[14], metadata[15]]) as usize;
     let version_padded = (version_length + 3) & !3;
     let streams_offset = 16 + version_padded;
 
@@ -322,9 +425,8 @@ fn find_entry_point_in_metadata(metadata: &[u8]) -> Option<u32> {
         return None;
     }
 
-    let num_streams = u16::from_le_bytes([
-        metadata[streams_offset + 2], metadata[streams_offset + 3],
-    ]) as usize;
+    let num_streams =
+        u16::from_le_bytes([metadata[streams_offset + 2], metadata[streams_offset + 3]]) as usize;
 
     // Find #Strings and #~ streams
     let mut strings_offset = 0usize;
@@ -339,10 +441,16 @@ fn find_entry_point_in_metadata(metadata: &[u8]) -> Option<u32> {
         }
 
         let stream_offset = u32::from_le_bytes([
-            metadata[pos], metadata[pos + 1], metadata[pos + 2], metadata[pos + 3],
+            metadata[pos],
+            metadata[pos + 1],
+            metadata[pos + 2],
+            metadata[pos + 3],
         ]) as usize;
         let stream_size = u32::from_le_bytes([
-            metadata[pos + 4], metadata[pos + 5], metadata[pos + 6], metadata[pos + 7],
+            metadata[pos + 4],
+            metadata[pos + 5],
+            metadata[pos + 6],
+            metadata[pos + 7],
         ]) as usize;
 
         pos += 8;
@@ -408,7 +516,8 @@ fn find_main_method_token(tilde: &[u8], strings: &[u8]) -> Option<u32> {
             if pos + 4 > tilde.len() {
                 return None;
             }
-            let count = u32::from_le_bytes([tilde[pos], tilde[pos + 1], tilde[pos + 2], tilde[pos + 3]]);
+            let count =
+                u32::from_le_bytes([tilde[pos], tilde[pos + 1], tilde[pos + 2], tilde[pos + 3]]);
             row_counts.push(count);
             pos += 4;
         }
@@ -425,7 +534,14 @@ fn find_main_method_token(tilde: &[u8], strings: &[u8]) -> Option<u32> {
                 methoddef_offset = current_offset;
                 break;
             }
-            let row_size = get_table_row_size(i, &row_counts, valid, string_idx_size, guid_idx_size, blob_idx_size);
+            let row_size = get_table_row_size(
+                i,
+                &row_counts,
+                valid,
+                string_idx_size,
+                guid_idx_size,
+                blob_idx_size,
+            );
             let table_index = count_bits_before(valid, i);
             let row_count = *row_counts.get(table_index)? as usize;
             current_offset += row_size * row_count;
@@ -465,7 +581,10 @@ fn find_main_method_token(tilde: &[u8], strings: &[u8]) -> Option<u32> {
 
         let name_index = if string_idx_size == 4 {
             u32::from_le_bytes([
-                tilde[name_pos], tilde[name_pos + 1], tilde[name_pos + 2], tilde[name_pos + 3],
+                tilde[name_pos],
+                tilde[name_pos + 1],
+                tilde[name_pos + 2],
+                tilde[name_pos + 3],
             ]) as usize
         } else {
             u16::from_le_bytes([tilde[name_pos], tilde[name_pos + 1]]) as usize
@@ -515,9 +634,8 @@ pub fn extract_method_rvas(metadata: &[u8]) -> Vec<MethodRvaInfo> {
     }
 
     // Parse metadata header
-    let version_length = u32::from_le_bytes([
-        metadata[12], metadata[13], metadata[14], metadata[15],
-    ]) as usize;
+    let version_length =
+        u32::from_le_bytes([metadata[12], metadata[13], metadata[14], metadata[15]]) as usize;
     let version_padded = (version_length + 3) & !3;
     let streams_offset = 16 + version_padded;
 
@@ -525,9 +643,8 @@ pub fn extract_method_rvas(metadata: &[u8]) -> Vec<MethodRvaInfo> {
         return methods;
     }
 
-    let num_streams = u16::from_le_bytes([
-        metadata[streams_offset + 2], metadata[streams_offset + 3],
-    ]) as usize;
+    let num_streams =
+        u16::from_le_bytes([metadata[streams_offset + 2], metadata[streams_offset + 3]]) as usize;
 
     // Find #Strings and #~ streams
     let mut strings_offset = 0usize;
@@ -542,10 +659,16 @@ pub fn extract_method_rvas(metadata: &[u8]) -> Vec<MethodRvaInfo> {
         }
 
         let stream_offset = u32::from_le_bytes([
-            metadata[pos], metadata[pos + 1], metadata[pos + 2], metadata[pos + 3],
+            metadata[pos],
+            metadata[pos + 1],
+            metadata[pos + 2],
+            metadata[pos + 3],
         ]) as usize;
         let stream_size = u32::from_le_bytes([
-            metadata[pos + 4], metadata[pos + 5], metadata[pos + 6], metadata[pos + 7],
+            metadata[pos + 4],
+            metadata[pos + 5],
+            metadata[pos + 6],
+            metadata[pos + 7],
         ]) as usize;
 
         pos += 8;
@@ -608,7 +731,8 @@ pub fn extract_method_rvas(metadata: &[u8]) -> Vec<MethodRvaInfo> {
             if pos + 4 > tilde.len() {
                 return methods;
             }
-            let count = u32::from_le_bytes([tilde[pos], tilde[pos + 1], tilde[pos + 2], tilde[pos + 3]]);
+            let count =
+                u32::from_le_bytes([tilde[pos], tilde[pos + 1], tilde[pos + 2], tilde[pos + 3]]);
             row_counts.push(count);
             pos += 4;
         }
@@ -625,7 +749,14 @@ pub fn extract_method_rvas(metadata: &[u8]) -> Vec<MethodRvaInfo> {
                 methoddef_offset = current_offset;
                 break;
             }
-            let row_size = get_table_row_size(i, &row_counts, valid, string_idx_size, guid_idx_size, blob_idx_size);
+            let row_size = get_table_row_size(
+                i,
+                &row_counts,
+                valid,
+                string_idx_size,
+                guid_idx_size,
+                blob_idx_size,
+            );
             let table_index = count_bits_before(valid, i);
             let Some(&row_count) = row_counts.get(table_index) else {
                 return methods;
@@ -663,7 +794,10 @@ pub fn extract_method_rvas(metadata: &[u8]) -> Vec<MethodRvaInfo> {
 
         // Read RVA (first 4 bytes)
         let rva = u32::from_le_bytes([
-            tilde[row_offset], tilde[row_offset + 1], tilde[row_offset + 2], tilde[row_offset + 3],
+            tilde[row_offset],
+            tilde[row_offset + 1],
+            tilde[row_offset + 2],
+            tilde[row_offset + 3],
         ]);
 
         // Skip methods with RVA 0 (abstract/extern methods)
@@ -679,7 +813,10 @@ pub fn extract_method_rvas(metadata: &[u8]) -> Vec<MethodRvaInfo> {
             if name_pos + string_idx_size <= tilde.len() {
                 let name_index = if string_idx_size == 4 {
                     u32::from_le_bytes([
-                        tilde[name_pos], tilde[name_pos + 1], tilde[name_pos + 2], tilde[name_pos + 3],
+                        tilde[name_pos],
+                        tilde[name_pos + 1],
+                        tilde[name_pos + 2],
+                        tilde[name_pos + 3],
                     ]) as usize
                 } else {
                     u16::from_le_bytes([tilde[name_pos], tilde[name_pos + 1]]) as usize
@@ -737,7 +874,8 @@ pub fn build_pe_from_metadata(metadata: &[u8], is_64bit: bool) -> Vec<u8> {
     let text_raw_size = COR20_SIZE + metadata_size;
     let text_raw_size_aligned = (text_raw_size + FILE_ALIGNMENT - 1) & !(FILE_ALIGNMENT - 1);
     let text_virtual_size = COR20_SIZE + metadata_size;
-    let size_of_image = TEXT_RVA + ((text_virtual_size + SECTION_ALIGNMENT - 1) & !(SECTION_ALIGNMENT - 1));
+    let size_of_image =
+        TEXT_RVA + ((text_virtual_size + SECTION_ALIGNMENT - 1) & !(SECTION_ALIGNMENT - 1));
 
     let total_file_size = SIZE_OF_HEADERS as usize + text_raw_size_aligned as usize;
     let mut pe = vec![0u8; total_file_size];
@@ -764,8 +902,12 @@ pub fn build_pe_from_metadata(metadata: &[u8], is_64bit: bool) -> Vec<u8> {
     // TimeDateStamp, PointerToSymbolTable, NumberOfSymbols = 0
     let size_of_optional_header: u16 = if is_64bit { 240 } else { 224 };
     pe[0x94..0x96].copy_from_slice(&size_of_optional_header.to_le_bytes());
-    // Characteristics: EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE | DLL
-    let characteristics: u16 = 0x0002 | 0x0020 | 0x2000;
+    // Characteristics: EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+    // Add DLL flag only if no entry point (it's a library)
+    let mut characteristics: u16 = 0x0002 | 0x0020; // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+    if entry_point_token == 0 {
+        characteristics |= 0x2000; // IMAGE_FILE_DLL
+    }
     pe[0x96..0x98].copy_from_slice(&characteristics.to_le_bytes());
 
     // Optional Header starts at 0x98
@@ -861,16 +1003,21 @@ pub fn build_pe_from_metadata(metadata: &[u8], is_64bit: bool) -> Vec<u8> {
     // Name: ".text\0\0\0"
     pe[section_header_offset..section_header_offset + 5].copy_from_slice(b".text");
     // VirtualSize
-    pe[section_header_offset + 8..section_header_offset + 12].copy_from_slice(&text_virtual_size.to_le_bytes());
+    pe[section_header_offset + 8..section_header_offset + 12]
+        .copy_from_slice(&text_virtual_size.to_le_bytes());
     // VirtualAddress
-    pe[section_header_offset + 12..section_header_offset + 16].copy_from_slice(&TEXT_RVA.to_le_bytes());
+    pe[section_header_offset + 12..section_header_offset + 16]
+        .copy_from_slice(&TEXT_RVA.to_le_bytes());
     // SizeOfRawData
-    pe[section_header_offset + 16..section_header_offset + 20].copy_from_slice(&text_raw_size_aligned.to_le_bytes());
+    pe[section_header_offset + 16..section_header_offset + 20]
+        .copy_from_slice(&text_raw_size_aligned.to_le_bytes());
     // PointerToRawData
-    pe[section_header_offset + 20..section_header_offset + 24].copy_from_slice(&SIZE_OF_HEADERS.to_le_bytes());
+    pe[section_header_offset + 20..section_header_offset + 24]
+        .copy_from_slice(&SIZE_OF_HEADERS.to_le_bytes());
     // Characteristics: CNT_CODE | MEM_EXECUTE | MEM_READ
     let section_chars: u32 = 0x00000020 | 0x20000000 | 0x40000000;
-    pe[section_header_offset + 36..section_header_offset + 40].copy_from_slice(&section_chars.to_le_bytes());
+    pe[section_header_offset + 36..section_header_offset + 40]
+        .copy_from_slice(&section_chars.to_le_bytes());
 
     // COR20 Header at file offset 0x200 (SIZE_OF_HEADERS)
     let cor20_offset = SIZE_OF_HEADERS as usize;
@@ -964,7 +1111,12 @@ pub fn build_pe_from_metadata_with_il(
     pe[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // NumberOfSections = 1
     let size_of_optional_header: u16 = if is_64bit { 240 } else { 224 };
     pe[0x94..0x96].copy_from_slice(&size_of_optional_header.to_le_bytes());
-    let characteristics: u16 = 0x0002 | 0x0020 | 0x2000;
+    // Characteristics: EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+    // Add DLL flag only if no entry point (it's a library)
+    let mut characteristics: u16 = 0x0002 | 0x0020; // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+    if entry_point_token == 0 {
+        characteristics |= 0x2000; // IMAGE_FILE_DLL
+    }
     pe[0x96..0x98].copy_from_slice(&characteristics.to_le_bytes());
 
     // Optional Header starts at 0x98
@@ -1028,7 +1180,8 @@ pub fn build_pe_from_metadata_with_il(
     // .text section content starts at file offset SIZE_OF_HEADERS (0x200)
     // RVA 0x1000 maps to file offset 0x200
     // RVA X maps to file offset 0x200 + (X - 0x1000)
-    let rva_to_file_offset = |rva: u32| -> usize { SIZE_OF_HEADERS as usize + (rva - TEXT_RVA) as usize };
+    let rva_to_file_offset =
+        |rva: u32| -> usize { SIZE_OF_HEADERS as usize + (rva - TEXT_RVA) as usize };
 
     // COR20 Header at RVA 0x1000 (file offset 0x200)
     let cor20_offset = rva_to_file_offset(TEXT_RVA);

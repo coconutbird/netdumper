@@ -692,7 +692,9 @@ fn read_il_method_body(process_handle: HANDLE, il_addr: usize) -> Option<Vec<u8>
         // LocalVarSigTok: u32
         let flags = u16::from_le_bytes([fat_header[0], fat_header[1]]);
         let header_size = ((flags >> 12) & 0x0F) as usize * 4; // Size in dwords
-        let code_size = u32::from_le_bytes([fat_header[4], fat_header[5], fat_header[6], fat_header[7]]) as usize;
+        let code_size =
+            u32::from_le_bytes([fat_header[4], fat_header[5], fat_header[6], fat_header[7]])
+                as usize;
 
         // Check for exception handlers (CorILMethod_MoreSects = 0x08)
         let has_more_sects = (flags & 0x08) != 0;
@@ -730,7 +732,9 @@ fn read_il_method_body(process_handle: HANDLE, il_addr: usize) -> Option<Vec<u8>
 
             // If we have more sections, try to determine actual size
             if has_more_sects && bytes_read >= header_size + code_size {
-                if let Some(actual_size) = calculate_method_size_with_eh(&data, header_size, code_size) {
+                if let Some(actual_size) =
+                    calculate_method_size_with_eh(&data, header_size, code_size)
+                {
                     data.truncate(actual_size);
                 }
             } else {
@@ -749,7 +753,11 @@ fn read_il_method_body(process_handle: HANDLE, il_addr: usize) -> Option<Vec<u8>
 }
 
 /// Calculate the total method size including exception handlers.
-fn calculate_method_size_with_eh(data: &[u8], header_size: usize, code_size: usize) -> Option<usize> {
+fn calculate_method_size_with_eh(
+    data: &[u8],
+    header_size: usize,
+    code_size: usize,
+) -> Option<usize> {
     // Exception handler section starts at 4-byte aligned offset after code
     let eh_offset = (header_size + code_size + 3) & !3;
 
