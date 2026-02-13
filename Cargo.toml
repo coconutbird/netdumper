@@ -2,8 +2,6 @@
 resolver = "2"
 members = [
     "crates/netdumper-cli",
-    "crates/netdumper-shared",
-    "crates/netdumper-payload",
 ]
 
 [workspace.package]
@@ -11,6 +9,3 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/coconutbird/netdumper"
-
-[workspace.dependencies]
-netdumper-shared = { path = "crates/netdumper-shared" }

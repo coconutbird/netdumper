@@ -1,0 +1,14 @@
+C:\Users\dev\Documents\Git\coconutbird\netdumper\testapp\bin\Debug\net10.0\testapp.exe
+C:\Users\dev\Documents\Git\coconutbird\netdumper\testapp\bin\Debug\net10.0\testapp.deps.json
+C:\Users\dev\Documents\Git\coconutbird\netdumper\testapp\bin\Debug\net10.0\testapp.runtimeconfig.json
+C:\Users\dev\Documents\Git\coconutbird\netdumper\testapp\bin\Debug\net10.0\testapp.dll
+C:\Users\dev\Documents\Git\coconutbird\netdumper\testapp\bin\Debug\net10.0\testapp.pdb
+C:\Users\dev\Documents\Git\coconutbird\netdumper\testapp\obj\Debug\net10.0\testapp.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\dev\Documents\Git\coconutbird\netdumper\testapp\obj\Debug\net10.0\testapp.AssemblyInfoInputs.cache
+C:\Users\dev\Documents\Git\coconutbird\netdumper\testapp\obj\Debug\net10.0\testapp.AssemblyInfo.cs
+C:\Users\dev\Documents\Git\coconutbird\netdumper\testapp\obj\Debug\net10.0\testapp.csproj.CoreCompileInputs.cache
+C:\Users\dev\Documents\Git\coconutbird\netdumper\testapp\obj\Debug\net10.0\testapp.dll
+C:\Users\dev\Documents\Git\coconutbird\netdumper\testapp\obj\Debug\net10.0\refint\testapp.dll
+C:\Users\dev\Documents\Git\coconutbird\netdumper\testapp\obj\Debug\net10.0\testapp.pdb
+C:\Users\dev\Documents\Git\coconutbird\netdumper\testapp\obj\Debug\net10.0\testapp.genruntimeconfig.cache
+C:\Users\dev\Documents\Git\coconutbird\netdumper\testapp\obj\Debug\net10.0\ref\testapp.dll

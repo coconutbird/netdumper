@@ -1,0 +1,7 @@
+Enumerating assemblies from process 6860 (external mode)...
+
+=== Loaded Assemblies (8) ===
+
+   
+    Base: 0x7FFA5F050000
+    Size: 0x348224

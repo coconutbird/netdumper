@@ -1,1 +1,28 @@
+# Build artifacts
 /target
+**/target
+
+# Cargo lock (optional - uncomment if you want to ignore it for libraries)
+# Cargo.lock
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Dump output directories
+dump_*/
+
+# Debug files
+*.pdb
+
+# Backup files
+*.bak
+*.orig

@@ -1,13 +1,18 @@
 [package]
-name = "netdumper-cli"
+name = "netdumper"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "netdumper"
+path = "src/main.rs"
+
 [dependencies]
-netdumper-shared = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+thiserror = "2"
 
 [target.'cfg(windows)'.dependencies]
+mscoree = { git = "https://github.com/coconutbird/mscoree-rs.git" }
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
@@ -17,4 +22,5 @@ windows = { version = "0.61", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_Security",
 ]}
+windows-core = "0.61"
 
