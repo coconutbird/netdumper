@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+sha1 = "0.10.6"
 thiserror = "2"
 ureq = "3.2.0"
 

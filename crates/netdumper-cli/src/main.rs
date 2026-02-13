@@ -266,7 +266,7 @@ fn main() {
 }
 
 fn analyze_dump_file(path: &str) {
-    use crate::pe::{MetadataError, extract_assembly_name_from_metadata_debug};
+    use crate::pe::{extract_assembly_metadata, extract_assembly_name_from_metadata_debug};
 
     println!("\n=== Analyzing {} ===\n", path);
 
@@ -524,6 +524,39 @@ fn analyze_dump_file(path: &str) {
     match extract_assembly_name_from_metadata_debug(&data) {
         Ok(name) => println!("\n✓ Assembly name: {}", name),
         Err(e) => eprintln!("\nERROR: Metadata extraction failed: {:?}", e),
+    }
+
+    // Extract and display full assembly metadata
+    println!("\nAssembly Metadata:");
+    match extract_assembly_metadata(&data) {
+        Some(meta) => {
+            println!("  Name: {}", meta.name);
+            println!("  Version: {}", meta.version_string());
+            println!(
+                "  Culture: {}",
+                if meta.culture.is_empty() {
+                    "neutral"
+                } else {
+                    &meta.culture
+                }
+            );
+            println!(
+                "  PublicKeyToken: {}",
+                meta.public_key_token.as_deref().unwrap_or("null")
+            );
+            if let Some(pk) = &meta.public_key {
+                if pk.len() <= 64 {
+                    println!("  PublicKey: {}", pk);
+                } else {
+                    println!("  PublicKey: {}... ({} bytes)", &pk[..64], pk.len() / 2);
+                }
+            }
+            println!("  Flags: 0x{:08X}", meta.flags);
+            println!("\n  Full Name: {}", meta.full_name());
+        }
+        None => {
+            println!("  (Could not extract - may be a netmodule or corrupted)");
+        }
     }
 }
 
