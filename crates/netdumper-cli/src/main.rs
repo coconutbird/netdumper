@@ -43,6 +43,15 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
     },
+    /// Diagnose why .NET detection might be failing for a process
+    Diagnose {
+        /// Process ID to target
+        #[arg(short, long, group = "target")]
+        pid: Option<u32>,
+        /// Process name to target (e.g., "dnSpy.exe" or "dnSpy")
+        #[arg(short, long, group = "target")]
+        name: Option<String>,
+    },
 }
 
 fn main() {
@@ -135,6 +144,90 @@ fn main() {
                 Err(e) => {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
+                }
+            }
+        }
+        Commands::Diagnose { pid, name } => {
+            let target_pid = match resolve_target(pid, name) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            println!(
+                "\n=== .NET Detection Diagnostics for PID {} ===\n",
+                target_pid
+            );
+
+            // Always run diagnostics first to get embedded CLR info
+            let diag_result = dac::diagnose_process(target_pid);
+
+            // Then try normal detection
+            match dac::find_runtime_directory_by_pid(target_pid) {
+                Ok(Some(info)) => {
+                    println!("✓ .NET runtime detected!");
+                    println!("  Type: {:?}", info.runtime_type);
+                    println!("  Directory: {}", info.directory.display());
+                    println!("  DAC path: {}", info.dac_path().display());
+                    println!("  DAC exists: {}", info.dac_path().exists());
+
+                    // Show embedded CLR info if available
+                    if let Ok(ref diag) = diag_result {
+                        if diag.has_embedded_clr {
+                            println!("\n  Embedded CLR: Yes (single-file deployment)");
+                            if let Some((major, minor, build, revision)) = diag.embedded_clr_version
+                            {
+                                println!(
+                                    "  Embedded CLR version: {}.{}.{}.{}",
+                                    major, minor, build, revision
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {
+                    println!("✗ No .NET runtime detected via standard method\n");
+
+                    // Show diagnostics
+                    match diag_result {
+                        Ok(diag) => {
+                            println!("Executable has CLR header: {}", diag.exe_has_clr_header);
+                            println!("Has embedded CLR (single-file): {}", diag.has_embedded_clr);
+
+                            if let Some((major, minor, build, revision)) = diag.embedded_clr_version
+                            {
+                                println!(
+                                    "Embedded CLR version: {}.{}.{}.{}",
+                                    major, minor, build, revision
+                                );
+                            }
+
+                            println!(
+                                "\nPotential .NET modules found: {}",
+                                diag.potential_dotnet_modules.len()
+                            );
+                            for m in &diag.potential_dotnet_modules {
+                                println!("  - {}", m);
+                            }
+
+                            println!("\nTotal modules loaded: {}", diag.modules.len());
+                            println!("\nLikely reason for detection failure:");
+                            println!("{}", diag.failure_reason);
+
+                            println!("\n--- All loaded modules ---");
+                            for m in &diag.modules {
+                                println!("  {}", m);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Diagnostics failed: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error during detection: {}", e);
                 }
             }
         }
