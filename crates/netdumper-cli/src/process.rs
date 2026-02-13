@@ -485,3 +485,300 @@ unsafe fn get_assembly_info(
 
     Some(info)
 }
+
+// =============================================================================
+// IL Method Body Reading
+// =============================================================================
+
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+
+/// Read IL bodies for a specific module in a process.
+/// This re-establishes DAC connection to call GetILForModule.
+///
+/// # Arguments
+/// * `pid` - Process ID
+/// * `module_address` - DAC module address (from AssemblyInfo.module_address)
+/// * `method_rvas` - List of method RVAs from metadata (only those with rva != 0)
+///
+/// # Returns
+/// Vector of IL bodies with their RVAs
+pub fn read_il_bodies_for_module(
+    pid: u32,
+    module_address: u64,
+    method_rvas: &[u32],
+) -> Vec<ILMethodBody> {
+    // Try to get DAC interface
+    let process_info = match ProcessInfo::new(pid) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+
+    let process_handle = process_info.handle.as_raw();
+
+    // Find runtime and load DAC
+    let dac_path = if process_info.is_embedded_clr {
+        // For embedded CLR, try to find matching DAC
+        if let Some(ref info) = process_info.embedded_clr_info {
+            find_best_matching_dac(info.major(), info.minor(), info.build())
+        } else {
+            // Fall back to finding any system runtime
+            find_all_system_dotnet_runtimes()
+                .into_iter()
+                .map(|dir| dir.join("mscordaccore.dll"))
+                .find(|p| p.exists())
+        }
+    } else {
+        find_runtime_directory_by_pid(pid)
+            .ok()
+            .flatten()
+            .map(|info| info.dac_path())
+    };
+
+    let dac_path = match dac_path {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+
+    let create_instance = match load_dac_create_instance(&dac_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    // Create data target - need to clone handle since CLRDataTarget might need it
+    let data_target = match CLRDataTarget::new_external(pid) {
+        Ok(dt) => dt,
+        Err(_) => return Vec::new(),
+    };
+
+    // Get DAC interfaces
+    let mut xclr_process: *mut c_void = std::ptr::null_mut();
+    let hr = unsafe {
+        create_instance(
+            &IXCLRDataProcess::IID,
+            data_target as *mut c_void,
+            &mut xclr_process,
+        )
+    };
+
+    if hr.is_err() || xclr_process.is_null() {
+        return Vec::new();
+    }
+
+    let xclr: IXCLRDataProcess = unsafe { Interface::from_raw(xclr_process) };
+    let sos: ISOSDacInterface = match xclr.cast() {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    read_il_bodies(&sos, process_handle, module_address, method_rvas)
+}
+
+/// IL method body with its RVA.
+#[derive(Debug, Clone)]
+pub struct ILMethodBody {
+    /// RVA where this IL should be placed in the PE.
+    pub rva: u32,
+    /// Raw IL method body bytes (including header).
+    pub data: Vec<u8>,
+}
+
+/// Read IL method bodies from a process using DAC.
+///
+/// This function:
+/// 1. Takes method RVAs from metadata
+/// 2. Calls GetILForModule to get IL addresses in process memory
+/// 3. Reads IL bodies (determining size from IL header format)
+/// 4. Returns (rva, bytes) pairs for PE reconstruction
+fn read_il_bodies(
+    sos: &ISOSDacInterface,
+    process_handle: HANDLE,
+    module_addr: u64,
+    method_rvas: &[u32],
+) -> Vec<ILMethodBody> {
+    let mut bodies = Vec::new();
+
+    for &rva in method_rvas {
+        if rva == 0 {
+            continue;
+        }
+
+        // Get IL address from DAC
+        let mut il_addr: CLRDATA_ADDRESS = 0;
+        let hr = unsafe { sos.GetILForModule(module_addr, rva, &mut il_addr) };
+
+        if hr.is_err() || il_addr == 0 {
+            continue;
+        }
+
+        // Read IL method body
+        if let Some(data) = read_il_method_body(process_handle, il_addr as usize) {
+            bodies.push(ILMethodBody { rva, data });
+        }
+    }
+
+    bodies
+}
+
+/// Read an IL method body from process memory.
+/// Determines size from the IL header format (tiny or fat).
+fn read_il_method_body(process_handle: HANDLE, il_addr: usize) -> Option<Vec<u8>> {
+    // First read the header byte to determine format
+    let mut header_byte = [0u8; 1];
+    let mut bytes_read = 0usize;
+
+    let result = unsafe {
+        ReadProcessMemory(
+            process_handle,
+            il_addr as *const c_void,
+            header_byte.as_mut_ptr() as *mut c_void,
+            1,
+            Some(&mut bytes_read),
+        )
+    };
+
+    if result.is_err() || bytes_read == 0 {
+        return None;
+    }
+
+    // IL Method Header Format (ECMA-335 II.25.4):
+    // Tiny format: (CodeSize << 2) | 0x02 - single byte header
+    // Fat format: Flags[0] & 0x03 == 0x03 - 12 byte header
+
+    let is_tiny = (header_byte[0] & 0x03) == 0x02;
+
+    if is_tiny {
+        // Tiny format: code size is in upper 6 bits
+        let code_size = (header_byte[0] >> 2) as usize;
+        let total_size = 1 + code_size;
+
+        let mut data = vec![0u8; total_size];
+        let result = unsafe {
+            ReadProcessMemory(
+                process_handle,
+                il_addr as *const c_void,
+                data.as_mut_ptr() as *mut c_void,
+                total_size,
+                Some(&mut bytes_read),
+            )
+        };
+
+        if result.is_ok() && bytes_read == total_size {
+            Some(data)
+        } else {
+            None
+        }
+    } else if (header_byte[0] & 0x03) == 0x03 {
+        // Fat format: need to read 12-byte header first
+        let mut fat_header = [0u8; 12];
+        let result = unsafe {
+            ReadProcessMemory(
+                process_handle,
+                il_addr as *const c_void,
+                fat_header.as_mut_ptr() as *mut c_void,
+                12,
+                Some(&mut bytes_read),
+            )
+        };
+
+        if result.is_err() || bytes_read != 12 {
+            return None;
+        }
+
+        // Fat header layout:
+        // Flags: u16 (includes header size in upper 4 bits of high byte)
+        // MaxStack: u16
+        // CodeSize: u32
+        // LocalVarSigTok: u32
+        let flags = u16::from_le_bytes([fat_header[0], fat_header[1]]);
+        let header_size = ((flags >> 12) & 0x0F) as usize * 4; // Size in dwords
+        let code_size = u32::from_le_bytes([fat_header[4], fat_header[5], fat_header[6], fat_header[7]]) as usize;
+
+        // Check for exception handlers (CorILMethod_MoreSects = 0x08)
+        let has_more_sects = (flags & 0x08) != 0;
+
+        let mut total_size = header_size + code_size;
+
+        // If there are more sections (exception handlers), we need to read them too
+        // For now, just read the code - exception handlers are complex
+        if has_more_sects {
+            // Align to 4-byte boundary after code
+            let aligned_end = (header_size + code_size + 3) & !3;
+            // Read a bit extra for exception handlers (estimate)
+            total_size = aligned_end + 256; // Conservative estimate
+        }
+
+        // Sanity check
+        if total_size > 1024 * 1024 {
+            return None; // Method too large, probably corrupt
+        }
+
+        let mut data = vec![0u8; total_size];
+        let result = unsafe {
+            ReadProcessMemory(
+                process_handle,
+                il_addr as *const c_void,
+                data.as_mut_ptr() as *mut c_void,
+                total_size,
+                Some(&mut bytes_read),
+            )
+        };
+
+        if result.is_ok() && bytes_read > 0 {
+            // Trim to actual size read
+            data.truncate(bytes_read);
+
+            // If we have more sections, try to determine actual size
+            if has_more_sects && bytes_read >= header_size + code_size {
+                if let Some(actual_size) = calculate_method_size_with_eh(&data, header_size, code_size) {
+                    data.truncate(actual_size);
+                }
+            } else {
+                // No extra sections, just header + code
+                data.truncate(header_size + code_size);
+            }
+
+            Some(data)
+        } else {
+            None
+        }
+    } else {
+        // Unknown format
+        None
+    }
+}
+
+/// Calculate the total method size including exception handlers.
+fn calculate_method_size_with_eh(data: &[u8], header_size: usize, code_size: usize) -> Option<usize> {
+    // Exception handler section starts at 4-byte aligned offset after code
+    let eh_offset = (header_size + code_size + 3) & !3;
+
+    if eh_offset >= data.len() {
+        return Some(header_size + code_size);
+    }
+
+    let eh_header = data[eh_offset];
+    let is_fat_eh = (eh_header & 0x40) != 0;
+
+    if is_fat_eh {
+        // Fat exception header: 4 bytes header + n * 24 bytes per clause
+        if eh_offset + 4 > data.len() {
+            return None;
+        }
+        let size = u32::from_le_bytes([
+            data[eh_offset] & 0x3F, // Lower 6 bits of first byte
+            data[eh_offset + 1],
+            data[eh_offset + 2],
+            0,
+        ]) as usize;
+        // Size includes the header
+        Some(eh_offset + ((size + 3) & !3))
+    } else {
+        // Small exception header: 4 bytes header + n * 12 bytes per clause
+        if eh_offset + 4 > data.len() {
+            return None;
+        }
+        let size = data[eh_offset + 1] as usize;
+        Some(eh_offset + size)
+    }
+}

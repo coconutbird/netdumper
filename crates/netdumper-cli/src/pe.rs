@@ -897,6 +897,164 @@ pub fn build_pe_from_metadata(metadata: &[u8], is_64bit: bool) -> Vec<u8> {
     pe
 }
 
+use crate::process::ILMethodBody;
+
+/// Build a PE from raw metadata bytes with IL method bodies at their original RVAs.
+/// This reconstructs a more complete assembly by placing IL code where the metadata expects it.
+///
+/// The key insight: MethodDef RVAs in metadata already point to specific addresses.
+/// We just need to ensure our PE has space at those RVAs and write the IL there.
+pub fn build_pe_from_metadata_with_il(
+    metadata: &[u8],
+    il_bodies: &[ILMethodBody],
+    is_64bit: bool,
+) -> Vec<u8> {
+    // If no IL bodies, fall back to basic PE
+    if il_bodies.is_empty() {
+        return build_pe_from_metadata(metadata, is_64bit);
+    }
+
+    let (entry_point_token, cor_flags) = extract_metadata_info(metadata);
+
+    const FILE_ALIGNMENT: u32 = 0x200;
+    const SECTION_ALIGNMENT: u32 = 0x1000;
+    const SIZE_OF_HEADERS: u32 = 0x200;
+    const TEXT_RVA: u32 = 0x1000;
+    const COR20_SIZE: u32 = 72;
+    const METADATA_RVA: u32 = TEXT_RVA + COR20_SIZE; // 0x1048
+
+    let metadata_size = metadata.len() as u32;
+
+    // Find the range of IL RVAs to determine PE layout
+    let min_il_rva = il_bodies.iter().map(|b| b.rva).min().unwrap_or(0);
+    let max_il_end = il_bodies
+        .iter()
+        .map(|b| b.rva + b.data.len() as u32)
+        .max()
+        .unwrap_or(0);
+
+    // Calculate .text section layout:
+    // - COR20 header at TEXT_RVA (0x1000)
+    // - Metadata immediately after (0x1048)
+    // - IL bodies at their original RVAs (may be after metadata or scattered)
+
+    // The .text section needs to span from TEXT_RVA to max(metadata_end, max_il_end)
+    let metadata_end_rva = METADATA_RVA + metadata_size;
+    let text_virtual_end = metadata_end_rva.max(max_il_end);
+    let text_virtual_size = text_virtual_end - TEXT_RVA;
+    let text_raw_size_aligned = (text_virtual_size + FILE_ALIGNMENT - 1) & !(FILE_ALIGNMENT - 1);
+    let size_of_image =
+        TEXT_RVA + ((text_virtual_size + SECTION_ALIGNMENT - 1) & !(SECTION_ALIGNMENT - 1));
+
+    let total_file_size = SIZE_OF_HEADERS as usize + text_raw_size_aligned as usize;
+    let mut pe = vec![0u8; total_file_size];
+
+    // DOS Header (64 bytes)
+    pe[0] = 0x4D; // 'M'
+    pe[1] = 0x5A; // 'Z'
+    pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+
+    // PE Signature at 0x80
+    pe[0x80] = 0x50; // 'P'
+    pe[0x81] = 0x45; // 'E'
+
+    // COFF Header (20 bytes at 0x84)
+    let machine = if is_64bit { 0x8664u16 } else { 0x014Cu16 };
+    pe[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
+    pe[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // NumberOfSections = 1
+    let size_of_optional_header: u16 = if is_64bit { 240 } else { 224 };
+    pe[0x94..0x96].copy_from_slice(&size_of_optional_header.to_le_bytes());
+    let characteristics: u16 = 0x0002 | 0x0020 | 0x2000;
+    pe[0x96..0x98].copy_from_slice(&characteristics.to_le_bytes());
+
+    // Optional Header starts at 0x98
+    let opt_base = 0x98usize;
+
+    if is_64bit {
+        pe[opt_base..opt_base + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        pe[opt_base + 2] = 14;
+        pe[opt_base + 16..opt_base + 20].copy_from_slice(&text_virtual_size.to_le_bytes());
+        pe[opt_base + 24..opt_base + 28].copy_from_slice(&TEXT_RVA.to_le_bytes());
+        pe[opt_base + 32..opt_base + 36].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
+        pe[opt_base + 36..opt_base + 40].copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
+        pe[opt_base + 40..opt_base + 44].copy_from_slice(&6u16.to_le_bytes());
+        pe[opt_base + 48..opt_base + 52].copy_from_slice(&6u16.to_le_bytes());
+        pe[opt_base + 56..opt_base + 60].copy_from_slice(&size_of_image.to_le_bytes());
+        pe[opt_base + 60..opt_base + 64].copy_from_slice(&SIZE_OF_HEADERS.to_le_bytes());
+        pe[opt_base + 68..opt_base + 70].copy_from_slice(&3u16.to_le_bytes());
+        pe[opt_base + 70..opt_base + 72].copy_from_slice(&0x8160u16.to_le_bytes());
+        pe[opt_base + 108..opt_base + 112].copy_from_slice(&16u32.to_le_bytes());
+        // CLR Runtime Header at data dir index 14
+        let clr_dir_offset = opt_base + 112 + 14 * 8;
+        pe[clr_dir_offset..clr_dir_offset + 4].copy_from_slice(&TEXT_RVA.to_le_bytes());
+        pe[clr_dir_offset + 4..clr_dir_offset + 8].copy_from_slice(&COR20_SIZE.to_le_bytes());
+    } else {
+        pe[opt_base..opt_base + 2].copy_from_slice(&0x10Bu16.to_le_bytes());
+        pe[opt_base + 2] = 14;
+        pe[opt_base + 16..opt_base + 20].copy_from_slice(&text_virtual_size.to_le_bytes());
+        pe[opt_base + 24..opt_base + 28].copy_from_slice(&TEXT_RVA.to_le_bytes());
+        pe[opt_base + 28..opt_base + 32].copy_from_slice(&TEXT_RVA.to_le_bytes());
+        pe[opt_base + 32..opt_base + 36].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
+        pe[opt_base + 36..opt_base + 40].copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
+        pe[opt_base + 40..opt_base + 44].copy_from_slice(&6u16.to_le_bytes());
+        pe[opt_base + 48..opt_base + 52].copy_from_slice(&6u16.to_le_bytes());
+        pe[opt_base + 56..opt_base + 60].copy_from_slice(&size_of_image.to_le_bytes());
+        pe[opt_base + 60..opt_base + 64].copy_from_slice(&SIZE_OF_HEADERS.to_le_bytes());
+        pe[opt_base + 68..opt_base + 70].copy_from_slice(&3u16.to_le_bytes());
+        pe[opt_base + 70..opt_base + 72].copy_from_slice(&0x8140u16.to_le_bytes());
+        pe[opt_base + 92..opt_base + 96].copy_from_slice(&16u32.to_le_bytes());
+        let clr_dir_offset = opt_base + 96 + 14 * 8;
+        pe[clr_dir_offset..clr_dir_offset + 4].copy_from_slice(&TEXT_RVA.to_le_bytes());
+        pe[clr_dir_offset + 4..clr_dir_offset + 8].copy_from_slice(&COR20_SIZE.to_le_bytes());
+    }
+
+    // Section Header (.text) at 0x188 (PE32+) or 0x178 (PE32)
+    let section_header_offset = if is_64bit { 0x188usize } else { 0x178usize };
+    pe[section_header_offset..section_header_offset + 8].copy_from_slice(b".text\0\0\0");
+    pe[section_header_offset + 8..section_header_offset + 12]
+        .copy_from_slice(&text_virtual_size.to_le_bytes());
+    pe[section_header_offset + 12..section_header_offset + 16]
+        .copy_from_slice(&TEXT_RVA.to_le_bytes());
+    pe[section_header_offset + 16..section_header_offset + 20]
+        .copy_from_slice(&text_raw_size_aligned.to_le_bytes());
+    pe[section_header_offset + 20..section_header_offset + 24]
+        .copy_from_slice(&SIZE_OF_HEADERS.to_le_bytes());
+    let section_characteristics: u32 = 0x60000020; // CODE | EXECUTE | READ
+    pe[section_header_offset + 36..section_header_offset + 40]
+        .copy_from_slice(&section_characteristics.to_le_bytes());
+
+    // .text section content starts at file offset SIZE_OF_HEADERS (0x200)
+    // RVA 0x1000 maps to file offset 0x200
+    // RVA X maps to file offset 0x200 + (X - 0x1000)
+    let rva_to_file_offset = |rva: u32| -> usize { SIZE_OF_HEADERS as usize + (rva - TEXT_RVA) as usize };
+
+    // COR20 Header at RVA 0x1000 (file offset 0x200)
+    let cor20_offset = rva_to_file_offset(TEXT_RVA);
+    pe[cor20_offset..cor20_offset + 4].copy_from_slice(&COR20_SIZE.to_le_bytes());
+    pe[cor20_offset + 4..cor20_offset + 6].copy_from_slice(&2u16.to_le_bytes());
+    pe[cor20_offset + 6..cor20_offset + 8].copy_from_slice(&5u16.to_le_bytes());
+    pe[cor20_offset + 8..cor20_offset + 12].copy_from_slice(&METADATA_RVA.to_le_bytes());
+    pe[cor20_offset + 12..cor20_offset + 16].copy_from_slice(&metadata_size.to_le_bytes());
+    pe[cor20_offset + 16..cor20_offset + 20].copy_from_slice(&cor_flags.to_le_bytes());
+    pe[cor20_offset + 20..cor20_offset + 24].copy_from_slice(&entry_point_token.to_le_bytes());
+
+    // Copy metadata at RVA 0x1048
+    let metadata_offset = rva_to_file_offset(METADATA_RVA);
+    pe[metadata_offset..metadata_offset + metadata.len()].copy_from_slice(metadata);
+
+    // Copy IL bodies at their original RVAs
+    for body in il_bodies {
+        if body.rva >= TEXT_RVA {
+            let file_offset = rva_to_file_offset(body.rva);
+            if file_offset + body.data.len() <= pe.len() {
+                pe[file_offset..file_offset + body.data.len()].copy_from_slice(&body.data);
+            }
+        }
+    }
+
+    pe
+}
+
 // =============================================================================
 // Layout Conversion
 // =============================================================================

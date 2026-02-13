@@ -10,11 +10,11 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 
 use crate::pe::{
-    build_pe_from_metadata, build_pe_with_reconstructed_headers, convert_memory_to_file_layout,
+    build_pe_from_metadata_with_il, build_pe_with_reconstructed_headers, convert_memory_to_file_layout,
     extract_assembly_name_from_metadata_debug, extract_metadata_info, extract_method_rvas,
     is_pe_header_corrupted, read_pe_info, reconstruct_pe_info, validate_cli_header_in_memory,
 };
-use crate::process::enumerate_assemblies_external;
+use crate::process::{enumerate_assemblies_external, read_il_bodies_for_module};
 use crate::target::ProcessInfo;
 use crate::{AssemblyInfo, Error, Result};
 
@@ -55,7 +55,7 @@ pub fn dump_assemblies_external(pid: u32, output_dir: &std::path::Path) -> Resul
 
     let mut results = Vec::with_capacity(assemblies.len());
     for assembly in &assemblies {
-        let result = dump_assembly(handle, assembly, output_dir, machine_type);
+        let result = dump_assembly(handle, assembly, output_dir, machine_type, pid);
         results.push(result);
     }
 
@@ -70,6 +70,7 @@ pub fn dump_assembly(
     assembly: &AssemblyInfo,
     output_dir: &std::path::Path,
     machine_type: u16,
+    pid: u32,
 ) -> DumpResult {
     // We'll determine the final name after reading the assembly
     let fallback_name = assembly.name.clone();
@@ -179,23 +180,35 @@ pub fn dump_assembly(
         // Extract metadata info for logging
         let (entry_point, _flags) = extract_metadata_info(&metadata);
         let method_rvas = extract_method_rvas(&metadata);
-        let methods_with_il = method_rvas.iter().filter(|m| m.rva != 0).count();
+        let rvas_only: Vec<u32> = method_rvas.iter().filter(|m| m.rva != 0).map(|m| m.rva).collect();
+        let methods_with_il = rvas_only.len();
+
+        // Read IL bodies using DAC's GetILForModule
+        let il_bodies = if assembly.module_address != 0 && !rvas_only.is_empty() {
+            eprintln!(
+                "  [INFO] {} - Reading {} IL method bodies from process memory...",
+                fallback_name, methods_with_il
+            );
+            read_il_bodies_for_module(pid, assembly.module_address as u64, &rvas_only)
+        } else {
+            Vec::new()
+        };
 
         if entry_point != 0 {
             eprintln!(
-                "  [INFO] {} - Reconstructing from metadata: entry point 0x{:08X}, {} methods with IL",
-                fallback_name, entry_point, methods_with_il
+                "  [INFO] {} - Reconstructing PE: entry point 0x{:08X}, {} methods with IL, {} IL bodies recovered",
+                fallback_name, entry_point, methods_with_il, il_bodies.len()
             );
         } else {
             eprintln!(
-                "  [INFO] {} - Reconstructing from metadata: no entry point, {} methods with IL",
-                fallback_name, methods_with_il
+                "  [INFO] {} - Reconstructing PE: no entry point, {} methods with IL, {} IL bodies recovered",
+                fallback_name, methods_with_il, il_bodies.len()
             );
         }
 
-        // Build PE from raw metadata
+        // Build PE from raw metadata with IL bodies
         let is_64bit = machine_type == 0x8664; // AMD64
-        build_pe_from_metadata(&metadata, is_64bit)
+        build_pe_from_metadata_with_il(&metadata, &il_bodies, is_64bit)
     } else {
         // Normal path - read full PE image
         let image_size = pe_info.size_of_image as usize;
