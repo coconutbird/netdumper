@@ -971,38 +971,40 @@ pub fn build_pe_from_metadata_with_il(
     let opt_base = 0x98usize;
 
     if is_64bit {
-        pe[opt_base..opt_base + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
-        pe[opt_base + 2] = 14;
-        pe[opt_base + 16..opt_base + 20].copy_from_slice(&text_virtual_size.to_le_bytes());
-        pe[opt_base + 24..opt_base + 28].copy_from_slice(&TEXT_RVA.to_le_bytes());
+        // PE32+ Optional Header
+        pe[opt_base..opt_base + 2].copy_from_slice(&0x20Bu16.to_le_bytes()); // Magic
+        pe[opt_base + 2] = 14; // MajorLinkerVersion
+        pe[opt_base + 16..opt_base + 20].copy_from_slice(&text_virtual_size.to_le_bytes()); // SizeOfCode
+        pe[opt_base + 24..opt_base + 28].copy_from_slice(&TEXT_RVA.to_le_bytes()); // BaseOfCode
         pe[opt_base + 32..opt_base + 36].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
         pe[opt_base + 36..opt_base + 40].copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
-        pe[opt_base + 40..opt_base + 44].copy_from_slice(&6u16.to_le_bytes());
-        pe[opt_base + 48..opt_base + 52].copy_from_slice(&6u16.to_le_bytes());
+        pe[opt_base + 40..opt_base + 42].copy_from_slice(&6u16.to_le_bytes()); // MajorOSVersion
+        pe[opt_base + 48..opt_base + 50].copy_from_slice(&6u16.to_le_bytes()); // MajorSubsystemVersion
         pe[opt_base + 56..opt_base + 60].copy_from_slice(&size_of_image.to_le_bytes());
         pe[opt_base + 60..opt_base + 64].copy_from_slice(&SIZE_OF_HEADERS.to_le_bytes());
-        pe[opt_base + 68..opt_base + 70].copy_from_slice(&3u16.to_le_bytes());
-        pe[opt_base + 70..opt_base + 72].copy_from_slice(&0x8160u16.to_le_bytes());
-        pe[opt_base + 108..opt_base + 112].copy_from_slice(&16u32.to_le_bytes());
+        pe[opt_base + 68..opt_base + 70].copy_from_slice(&3u16.to_le_bytes()); // Subsystem (CONSOLE)
+        pe[opt_base + 70..opt_base + 72].copy_from_slice(&0x8160u16.to_le_bytes()); // DllCharacteristics
+        pe[opt_base + 108..opt_base + 112].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
         // CLR Runtime Header at data dir index 14
         let clr_dir_offset = opt_base + 112 + 14 * 8;
         pe[clr_dir_offset..clr_dir_offset + 4].copy_from_slice(&TEXT_RVA.to_le_bytes());
         pe[clr_dir_offset + 4..clr_dir_offset + 8].copy_from_slice(&COR20_SIZE.to_le_bytes());
     } else {
-        pe[opt_base..opt_base + 2].copy_from_slice(&0x10Bu16.to_le_bytes());
-        pe[opt_base + 2] = 14;
-        pe[opt_base + 16..opt_base + 20].copy_from_slice(&text_virtual_size.to_le_bytes());
-        pe[opt_base + 24..opt_base + 28].copy_from_slice(&TEXT_RVA.to_le_bytes());
-        pe[opt_base + 28..opt_base + 32].copy_from_slice(&TEXT_RVA.to_le_bytes());
+        // PE32 Optional Header
+        pe[opt_base..opt_base + 2].copy_from_slice(&0x10Bu16.to_le_bytes()); // Magic
+        pe[opt_base + 2] = 14; // MajorLinkerVersion
+        pe[opt_base + 16..opt_base + 20].copy_from_slice(&text_virtual_size.to_le_bytes()); // SizeOfCode
+        pe[opt_base + 24..opt_base + 28].copy_from_slice(&TEXT_RVA.to_le_bytes()); // BaseOfCode
+        pe[opt_base + 28..opt_base + 32].copy_from_slice(&TEXT_RVA.to_le_bytes()); // BaseOfData
         pe[opt_base + 32..opt_base + 36].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
         pe[opt_base + 36..opt_base + 40].copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
-        pe[opt_base + 40..opt_base + 44].copy_from_slice(&6u16.to_le_bytes());
-        pe[opt_base + 48..opt_base + 52].copy_from_slice(&6u16.to_le_bytes());
+        pe[opt_base + 40..opt_base + 42].copy_from_slice(&6u16.to_le_bytes()); // MajorOSVersion
+        pe[opt_base + 48..opt_base + 50].copy_from_slice(&6u16.to_le_bytes()); // MajorSubsystemVersion
         pe[opt_base + 56..opt_base + 60].copy_from_slice(&size_of_image.to_le_bytes());
         pe[opt_base + 60..opt_base + 64].copy_from_slice(&SIZE_OF_HEADERS.to_le_bytes());
-        pe[opt_base + 68..opt_base + 70].copy_from_slice(&3u16.to_le_bytes());
-        pe[opt_base + 70..opt_base + 72].copy_from_slice(&0x8140u16.to_le_bytes());
-        pe[opt_base + 92..opt_base + 96].copy_from_slice(&16u32.to_le_bytes());
+        pe[opt_base + 68..opt_base + 70].copy_from_slice(&3u16.to_le_bytes()); // Subsystem (CONSOLE)
+        pe[opt_base + 70..opt_base + 72].copy_from_slice(&0x8140u16.to_le_bytes()); // DllCharacteristics
+        pe[opt_base + 92..opt_base + 96].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
         let clr_dir_offset = opt_base + 96 + 14 * 8;
         pe[clr_dir_offset..clr_dir_offset + 4].copy_from_slice(&TEXT_RVA.to_le_bytes());
         pe[clr_dir_offset + 4..clr_dir_offset + 8].copy_from_slice(&COR20_SIZE.to_le_bytes());
