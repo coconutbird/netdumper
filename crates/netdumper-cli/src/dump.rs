@@ -10,7 +10,7 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 
 use crate::pe::{
-    build_pe_with_reconstructed_headers, convert_memory_to_file_layout,
+    build_pe_from_metadata, build_pe_with_reconstructed_headers, convert_memory_to_file_layout,
     extract_assembly_name_from_metadata, extract_assembly_name_from_metadata_debug,
     is_pe_header_corrupted, read_pe_info, reconstruct_pe_info, validate_cli_header_in_memory,
 };
@@ -119,54 +119,101 @@ pub fn dump_assembly(
         },
     };
 
-    // // Validate that the CLI header is valid in memory
-    // // This catches cases where ilBase doesn't point to a real PE image
-    // // TODO: We need to decide what to do here
-    // if !validate_cli_header_in_memory(process_handle, assembly.base_address, &pe_info) {
-    //     let safe_name = sanitize_filename(&fallback_name);
-    //     let output_path = output_dir.join(format!("{}.dll", safe_name));
-    //     return DumpResult {
-    //         name: fallback_name,
-    //         output_path,
-    //         size: 0,
-    //         success: false,
-    //         error: Some("Invalid CLI header (ilBase may not point to valid PE)".into()),
-    //     };
-    // }
+    // Validate that the CLI header is valid in memory
+    // This catches cases where ilBase doesn't point to a real PE image
+    let cli_valid = validate_cli_header_in_memory(process_handle, assembly.base_address, &pe_info);
 
-    let image_size = pe_info.size_of_image as usize;
+    let file_image = if !cli_valid {
+        // CLI header is invalid - try to build PE from raw metadata
+        if assembly.metadata_address == 0 || assembly.metadata_size == 0 {
+            let safe_name = sanitize_filename(&fallback_name);
+            let output_path = output_dir.join(format!("{}.dll", safe_name));
+            return DumpResult {
+                name: fallback_name,
+                output_path,
+                size: 0,
+                success: false,
+                error: Some("Invalid CLI header and no metadata address available".into()),
+            };
+        }
 
-    // Read the assembly bytes page-by-page
-    let mut buffer = vec![0u8; image_size];
-    const PAGE_SIZE: usize = 0x1000;
-
-    for offset in (0..image_size).step_by(PAGE_SIZE) {
-        let chunk_size = PAGE_SIZE.min(image_size - offset);
+        // Read metadata directly from metadataStart
+        let mut metadata = vec![0u8; assembly.metadata_size];
         let mut bytes_read = 0usize;
 
-        let _ = unsafe {
+        let result = unsafe {
             ReadProcessMemory(
                 process_handle,
-                (assembly.base_address + offset) as *const c_void,
-                buffer[offset..].as_mut_ptr() as *mut c_void,
-                chunk_size,
+                assembly.metadata_address as *const c_void,
+                metadata.as_mut_ptr() as *mut c_void,
+                assembly.metadata_size,
                 Some(&mut bytes_read),
             )
         };
-    }
 
-    let use_reconstruction = needs_reconstruction || is_pe_header_corrupted(&buffer);
+        if result.is_err() || bytes_read < 4 {
+            let safe_name = sanitize_filename(&fallback_name);
+            let output_path = output_dir.join(format!("{}.dll", safe_name));
+            return DumpResult {
+                name: fallback_name,
+                output_path,
+                size: 0,
+                success: false,
+                error: Some("Failed to read metadata from process memory".into()),
+            };
+        }
 
-    let file_image = if use_reconstruction {
-        let reconstructed_info = if needs_reconstruction {
-            pe_info
-        } else {
-            reconstruct_pe_info(process_handle, assembly.base_address, machine_type)
-                .unwrap_or(pe_info)
-        };
-        build_pe_with_reconstructed_headers(&buffer, &reconstructed_info)
+        // Verify BSJB signature
+        if metadata.len() < 4 || &metadata[0..4] != b"BSJB" {
+            let safe_name = sanitize_filename(&fallback_name);
+            let output_path = output_dir.join(format!("{}.dll", safe_name));
+            return DumpResult {
+                name: fallback_name,
+                output_path,
+                size: 0,
+                success: false,
+                error: Some("Metadata does not have BSJB signature".into()),
+            };
+        }
+
+        // Build PE from raw metadata
+        let is_64bit = machine_type == 0x8664; // AMD64
+        build_pe_from_metadata(&metadata, is_64bit)
     } else {
-        convert_memory_to_file_layout(&buffer, &pe_info)
+        // Normal path - read full PE image
+        let image_size = pe_info.size_of_image as usize;
+
+        let mut buffer = vec![0u8; image_size];
+        const PAGE_SIZE: usize = 0x1000;
+
+        for offset in (0..image_size).step_by(PAGE_SIZE) {
+            let chunk_size = PAGE_SIZE.min(image_size - offset);
+            let mut bytes_read = 0usize;
+
+            let _ = unsafe {
+                ReadProcessMemory(
+                    process_handle,
+                    (assembly.base_address + offset) as *const c_void,
+                    buffer[offset..].as_mut_ptr() as *mut c_void,
+                    chunk_size,
+                    Some(&mut bytes_read),
+                )
+            };
+        }
+
+        let use_reconstruction = needs_reconstruction || is_pe_header_corrupted(&buffer);
+
+        if use_reconstruction {
+            let reconstructed_info = if needs_reconstruction {
+                pe_info
+            } else {
+                reconstruct_pe_info(process_handle, assembly.base_address, machine_type)
+                    .unwrap_or(pe_info)
+            };
+            build_pe_with_reconstructed_headers(&buffer, &reconstructed_info)
+        } else {
+            convert_memory_to_file_layout(&buffer, &pe_info)
+        }
     };
 
     // Try to extract the real assembly name from .NET metadata
@@ -174,8 +221,8 @@ pub fn dump_assembly(
         Ok(name) => name,
         Err(e) => {
             eprintln!(
-                "  [DEBUG] {} metadata error: {:?} (reconstruction={})",
-                fallback_name, e, use_reconstruction
+                "  [DEBUG] {} metadata error: {:?} (cli_valid={})",
+                fallback_name, e, cli_valid
             );
             fallback_name
         }

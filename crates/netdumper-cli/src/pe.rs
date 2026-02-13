@@ -283,6 +283,191 @@ pub fn validate_cli_header_in_memory(
     true
 }
 
+/// Build a minimal PE from raw metadata bytes.
+/// This is used when ilBase doesn't point to a valid PE but we have metadata from DAC.
+///
+/// PE Layout:
+/// 0x000: DOS Header (64 bytes)
+/// 0x040: DOS Stub (64 bytes)
+/// 0x080: PE Signature (4 bytes)
+/// 0x084: COFF Header (20 bytes)
+/// 0x098: Optional Header PE32+ (112 bytes + 16*8 data dirs = 240 bytes)
+/// 0x188: Section Header .text (40 bytes)
+/// 0x1B0: Padding to 0x200
+/// 0x200: .text section start
+/// 0x200: COR20 Header (72 bytes)
+/// 0x248: Metadata
+pub fn build_pe_from_metadata(metadata: &[u8], is_64bit: bool) -> Vec<u8> {
+    const FILE_ALIGNMENT: u32 = 0x200;
+    const SECTION_ALIGNMENT: u32 = 0x1000;
+    const SIZE_OF_HEADERS: u32 = 0x200;
+    const TEXT_RVA: u32 = 0x1000;
+    const COR20_SIZE: u32 = 72;
+    const METADATA_RVA: u32 = TEXT_RVA + COR20_SIZE; // 0x1048
+
+    let metadata_size = metadata.len() as u32;
+    let text_raw_size = COR20_SIZE + metadata_size;
+    let text_raw_size_aligned = (text_raw_size + FILE_ALIGNMENT - 1) & !(FILE_ALIGNMENT - 1);
+    let text_virtual_size = COR20_SIZE + metadata_size;
+    let size_of_image = TEXT_RVA + ((text_virtual_size + SECTION_ALIGNMENT - 1) & !(SECTION_ALIGNMENT - 1));
+
+    let total_file_size = SIZE_OF_HEADERS as usize + text_raw_size_aligned as usize;
+    let mut pe = vec![0u8; total_file_size];
+
+    // DOS Header (64 bytes)
+    pe[0] = 0x4D; // 'M'
+    pe[1] = 0x5A; // 'Z'
+    // e_lfanew at offset 0x3C = 0x80
+    pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+
+    // DOS Stub (0x40-0x7F) - minimal "This program cannot be run in DOS mode"
+    // We'll leave it as zeros for simplicity
+
+    // PE Signature at 0x80
+    pe[0x80] = 0x50; // 'P'
+    pe[0x81] = 0x45; // 'E'
+    pe[0x82] = 0x00;
+    pe[0x83] = 0x00;
+
+    // COFF Header (20 bytes at 0x84)
+    let machine = if is_64bit { 0x8664u16 } else { 0x014Cu16 }; // AMD64 or i386
+    pe[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
+    pe[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // NumberOfSections = 1
+    // TimeDateStamp, PointerToSymbolTable, NumberOfSymbols = 0
+    let size_of_optional_header: u16 = if is_64bit { 240 } else { 224 };
+    pe[0x94..0x96].copy_from_slice(&size_of_optional_header.to_le_bytes());
+    // Characteristics: EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE | DLL
+    let characteristics: u16 = 0x0002 | 0x0020 | 0x2000;
+    pe[0x96..0x98].copy_from_slice(&characteristics.to_le_bytes());
+
+    // Optional Header starts at 0x98
+    let opt_base = 0x98usize;
+
+    if is_64bit {
+        // PE32+ Magic
+        pe[opt_base..opt_base + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        // MajorLinkerVersion, MinorLinkerVersion
+        pe[opt_base + 2] = 14;
+        pe[opt_base + 3] = 0;
+        // SizeOfCode
+        pe[opt_base + 4..opt_base + 8].copy_from_slice(&text_raw_size_aligned.to_le_bytes());
+        // SizeOfInitializedData = 0
+        // SizeOfUninitializedData = 0
+        // AddressOfEntryPoint = 0 (pure IL assembly)
+        // BaseOfCode = TEXT_RVA
+        pe[opt_base + 20..opt_base + 24].copy_from_slice(&TEXT_RVA.to_le_bytes());
+        // ImageBase (8 bytes for PE32+) = 0x180000000
+        pe[opt_base + 24..opt_base + 32].copy_from_slice(&0x180000000u64.to_le_bytes());
+        // SectionAlignment
+        pe[opt_base + 32..opt_base + 36].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
+        // FileAlignment
+        pe[opt_base + 36..opt_base + 40].copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
+        // OS Version (6.0)
+        pe[opt_base + 40..opt_base + 42].copy_from_slice(&6u16.to_le_bytes());
+        pe[opt_base + 42..opt_base + 44].copy_from_slice(&0u16.to_le_bytes());
+        // Image Version = 0
+        // Subsystem Version (6.0)
+        pe[opt_base + 48..opt_base + 50].copy_from_slice(&6u16.to_le_bytes());
+        pe[opt_base + 50..opt_base + 52].copy_from_slice(&0u16.to_le_bytes());
+        // Win32VersionValue = 0
+        // SizeOfImage
+        pe[opt_base + 56..opt_base + 60].copy_from_slice(&size_of_image.to_le_bytes());
+        // SizeOfHeaders
+        pe[opt_base + 60..opt_base + 64].copy_from_slice(&SIZE_OF_HEADERS.to_le_bytes());
+        // CheckSum = 0
+        // Subsystem = WINDOWS_CUI (3)
+        pe[opt_base + 68..opt_base + 70].copy_from_slice(&3u16.to_le_bytes());
+        // DllCharacteristics: DYNAMIC_BASE | NX_COMPAT | NO_SEH | TERMINAL_SERVER_AWARE
+        let dll_chars: u16 = 0x0040 | 0x0100 | 0x0400 | 0x8000;
+        pe[opt_base + 70..opt_base + 72].copy_from_slice(&dll_chars.to_le_bytes());
+        // Stack/Heap sizes (8 bytes each for PE32+)
+        pe[opt_base + 72..opt_base + 80].copy_from_slice(&0x100000u64.to_le_bytes()); // SizeOfStackReserve
+        pe[opt_base + 80..opt_base + 88].copy_from_slice(&0x1000u64.to_le_bytes()); // SizeOfStackCommit
+        pe[opt_base + 88..opt_base + 96].copy_from_slice(&0x100000u64.to_le_bytes()); // SizeOfHeapReserve
+        pe[opt_base + 96..opt_base + 104].copy_from_slice(&0x1000u64.to_le_bytes()); // SizeOfHeapCommit
+        // LoaderFlags = 0
+        // NumberOfRvaAndSizes = 16
+        pe[opt_base + 108..opt_base + 112].copy_from_slice(&16u32.to_le_bytes());
+
+        // Data Directories start at opt_base + 112
+        // We only need CLI header (index 14)
+        let cli_dir_offset = opt_base + 112 + 14 * 8;
+        pe[cli_dir_offset..cli_dir_offset + 4].copy_from_slice(&TEXT_RVA.to_le_bytes()); // CLI RVA
+        pe[cli_dir_offset + 4..cli_dir_offset + 8].copy_from_slice(&COR20_SIZE.to_le_bytes()); // CLI Size
+    } else {
+        // PE32 Magic
+        pe[opt_base..opt_base + 2].copy_from_slice(&0x10Bu16.to_le_bytes());
+        pe[opt_base + 2] = 14;
+        pe[opt_base + 3] = 0;
+        pe[opt_base + 4..opt_base + 8].copy_from_slice(&text_raw_size_aligned.to_le_bytes());
+        pe[opt_base + 20..opt_base + 24].copy_from_slice(&TEXT_RVA.to_le_bytes());
+        // BaseOfData (PE32 only)
+        pe[opt_base + 24..opt_base + 28].copy_from_slice(&TEXT_RVA.to_le_bytes());
+        // ImageBase (4 bytes for PE32) = 0x10000000
+        pe[opt_base + 28..opt_base + 32].copy_from_slice(&0x10000000u32.to_le_bytes());
+        pe[opt_base + 32..opt_base + 36].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
+        pe[opt_base + 36..opt_base + 40].copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
+        pe[opt_base + 40..opt_base + 42].copy_from_slice(&6u16.to_le_bytes());
+        pe[opt_base + 42..opt_base + 44].copy_from_slice(&0u16.to_le_bytes());
+        pe[opt_base + 48..opt_base + 50].copy_from_slice(&6u16.to_le_bytes());
+        pe[opt_base + 50..opt_base + 52].copy_from_slice(&0u16.to_le_bytes());
+        pe[opt_base + 56..opt_base + 60].copy_from_slice(&size_of_image.to_le_bytes());
+        pe[opt_base + 60..opt_base + 64].copy_from_slice(&SIZE_OF_HEADERS.to_le_bytes());
+        pe[opt_base + 68..opt_base + 70].copy_from_slice(&3u16.to_le_bytes());
+        let dll_chars: u16 = 0x0040 | 0x0100 | 0x0400 | 0x8000;
+        pe[opt_base + 70..opt_base + 72].copy_from_slice(&dll_chars.to_le_bytes());
+        // Stack/Heap sizes (4 bytes each for PE32)
+        pe[opt_base + 72..opt_base + 76].copy_from_slice(&0x100000u32.to_le_bytes());
+        pe[opt_base + 76..opt_base + 80].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[opt_base + 80..opt_base + 84].copy_from_slice(&0x100000u32.to_le_bytes());
+        pe[opt_base + 84..opt_base + 88].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[opt_base + 92..opt_base + 96].copy_from_slice(&16u32.to_le_bytes());
+
+        let cli_dir_offset = opt_base + 96 + 14 * 8;
+        pe[cli_dir_offset..cli_dir_offset + 4].copy_from_slice(&TEXT_RVA.to_le_bytes());
+        pe[cli_dir_offset + 4..cli_dir_offset + 8].copy_from_slice(&COR20_SIZE.to_le_bytes());
+    }
+
+    // Section Header for .text
+    let section_header_offset = opt_base + size_of_optional_header as usize;
+    // Name: ".text\0\0\0"
+    pe[section_header_offset..section_header_offset + 5].copy_from_slice(b".text");
+    // VirtualSize
+    pe[section_header_offset + 8..section_header_offset + 12].copy_from_slice(&text_virtual_size.to_le_bytes());
+    // VirtualAddress
+    pe[section_header_offset + 12..section_header_offset + 16].copy_from_slice(&TEXT_RVA.to_le_bytes());
+    // SizeOfRawData
+    pe[section_header_offset + 16..section_header_offset + 20].copy_from_slice(&text_raw_size_aligned.to_le_bytes());
+    // PointerToRawData
+    pe[section_header_offset + 20..section_header_offset + 24].copy_from_slice(&SIZE_OF_HEADERS.to_le_bytes());
+    // Characteristics: CNT_CODE | MEM_EXECUTE | MEM_READ
+    let section_chars: u32 = 0x00000020 | 0x20000000 | 0x40000000;
+    pe[section_header_offset + 36..section_header_offset + 40].copy_from_slice(&section_chars.to_le_bytes());
+
+    // COR20 Header at file offset 0x200 (SIZE_OF_HEADERS)
+    let cor20_offset = SIZE_OF_HEADERS as usize;
+    // cb = 72
+    pe[cor20_offset..cor20_offset + 4].copy_from_slice(&COR20_SIZE.to_le_bytes());
+    // MajorRuntimeVersion = 2
+    pe[cor20_offset + 4..cor20_offset + 6].copy_from_slice(&2u16.to_le_bytes());
+    // MinorRuntimeVersion = 5
+    pe[cor20_offset + 6..cor20_offset + 8].copy_from_slice(&5u16.to_le_bytes());
+    // MetaData RVA
+    pe[cor20_offset + 8..cor20_offset + 12].copy_from_slice(&METADATA_RVA.to_le_bytes());
+    // MetaData Size
+    pe[cor20_offset + 12..cor20_offset + 16].copy_from_slice(&metadata_size.to_le_bytes());
+    // Flags = COMIMAGE_FLAGS_ILONLY
+    pe[cor20_offset + 16..cor20_offset + 20].copy_from_slice(&1u32.to_le_bytes());
+    // EntryPointToken = 0 (no entry point for class library)
+    // Rest of COR20 header fields are 0 (no resources, strong name, etc.)
+
+    // Copy metadata after COR20 header
+    let metadata_offset = cor20_offset + COR20_SIZE as usize;
+    pe[metadata_offset..metadata_offset + metadata.len()].copy_from_slice(metadata);
+
+    pe
+}
+
 // =============================================================================
 // Layout Conversion
 // =============================================================================
