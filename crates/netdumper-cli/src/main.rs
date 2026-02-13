@@ -1,6 +1,10 @@
 mod assembly;
-mod dac;
+mod dump;
 mod error;
+mod pe;
+mod process;
+mod runtime;
+mod target;
 
 use clap::{Parser, Subcommand};
 use windows::Win32::Foundation::CloseHandle;
@@ -71,7 +75,7 @@ fn main() {
                 }
             };
 
-            match dac::enumerate_assemblies_external(target_pid) {
+            match process::enumerate_assemblies_external(target_pid) {
                 Ok(assemblies) => {
                     println!("\n=== Loaded Assemblies ({}) ===\n", assemblies.len());
                     for asm in &assemblies {
@@ -107,7 +111,7 @@ fn main() {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::path::PathBuf::from(format!("dump_{}", target_pid)));
 
-            match dac::dump_assemblies_external(target_pid, &output_dir) {
+            match dump::dump_assemblies_external(target_pid, &output_dir) {
                 Ok(results) => {
                     let success_count = results.iter().filter(|r| r.success).count();
                     let fail_count = results.len() - success_count;
@@ -162,10 +166,10 @@ fn main() {
             );
 
             // Always run diagnostics first to get embedded CLR info
-            let diag_result = dac::diagnose_process(target_pid);
+            let diag_result = runtime::diagnose_process(target_pid);
 
             // Then try normal detection
-            match dac::find_runtime_directory_by_pid(target_pid) {
+            match runtime::find_runtime_directory_by_pid(target_pid) {
                 Ok(Some(info)) => {
                     println!("✓ .NET runtime detected!");
                     println!("  Type: {:?}", info.runtime_type);
@@ -174,8 +178,8 @@ fn main() {
                     println!("  DAC exists: {}", info.dac_path().exists());
 
                     // Show embedded CLR info if available
-                    if let Ok(ref diag) = diag_result {
-                        if diag.has_embedded_clr {
+                    if let Ok(ref diag) = diag_result
+                        && diag.has_embedded_clr {
                             println!("\n  Embedded CLR: Yes (single-file deployment)");
                             if let Some((major, minor, build, revision)) = diag.embedded_clr_version
                             {
@@ -185,7 +189,6 @@ fn main() {
                                 );
                             }
                         }
-                    }
                 }
                 Ok(None) => {
                     println!("✗ No .NET runtime detected via standard method\n");
