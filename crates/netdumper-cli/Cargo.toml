@@ -1,0 +1,20 @@
+[package]
+name = "netdumper-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+netdumper-shared = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_Security",
+]}
+
