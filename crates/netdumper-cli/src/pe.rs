@@ -1581,6 +1581,657 @@ pub fn build_pe_with_reconstructed_headers(memory_image: &[u8], pe_info: &PeInfo
 }
 
 // =============================================================================
+// Metadata Reconstruction (Anti-Anti-Dump)
+// =============================================================================
+
+/// Information about located metadata streams for reconstruction.
+#[derive(Debug, Clone, Default)]
+pub struct MetadataStreamLocations {
+    /// Offset of #~ or #- stream (table stream) relative to metadata start
+    pub tilde_offset: usize,
+    /// Size of #~ or #- stream
+    pub tilde_size: usize,
+    /// Whether this is compressed (#~) or uncompressed (#-)
+    pub is_compressed: bool,
+    /// Offset of #Strings heap
+    pub strings_offset: usize,
+    /// Size of #Strings heap
+    pub strings_size: usize,
+    /// Offset of #US (user strings) heap
+    pub us_offset: usize,
+    /// Size of #US heap
+    pub us_size: usize,
+    /// Offset of #GUID heap
+    pub guid_offset: usize,
+    /// Size of #GUID heap
+    pub guid_size: usize,
+    /// Offset of #Blob heap
+    pub blob_offset: usize,
+    /// Size of #Blob heap
+    pub blob_size: usize,
+}
+
+/// Try to locate the #~ stream by scanning for its characteristic pattern.
+/// The #~ stream starts with:
+/// - Reserved: u32 (usually 0)
+/// - MajorVersion: u8 (usually 2)
+/// - MinorVersion: u8 (usually 0)
+/// - HeapSizes: u8 (flags for heap index sizes)
+/// - Reserved: u8 (usually 1)
+/// - Valid: u64 (bitmask of present tables)
+/// - Sorted: u64 (bitmask of sorted tables)
+///
+/// We look for patterns where:
+/// - Valid mask has reasonable bits set (Module table 0x01 is always present)
+/// - Row counts following are reasonable (< 0x1000000)
+pub fn scan_for_tilde_stream(metadata: &[u8]) -> Option<(usize, usize)> {
+    // Minimum #~ header is 24 bytes + at least one row count
+    if metadata.len() < 28 {
+        return None;
+    }
+
+    // Scan through metadata looking for #~ stream pattern
+    for offset in 0..metadata.len().saturating_sub(28) {
+        if let Some(size) = check_tilde_stream_at(metadata, offset) {
+            return Some((offset, size));
+        }
+    }
+
+    None
+}
+
+/// Check if there's a valid #~ stream at the given offset.
+/// Returns the stream size if valid.
+fn check_tilde_stream_at(metadata: &[u8], offset: usize) -> Option<usize> {
+    if offset + 24 > metadata.len() {
+        return None;
+    }
+
+    let data = &metadata[offset..];
+
+    // Reserved should be 0
+    let reserved = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    if reserved != 0 {
+        return None;
+    }
+
+    // Major version should be 1 or 2
+    let major = data[4];
+    if major != 1 && major != 2 {
+        return None;
+    }
+
+    // Minor version should be 0
+    let minor = data[5];
+    if minor != 0 {
+        return None;
+    }
+
+    // HeapSizes is a flags byte (0-7 are valid values)
+    let heap_sizes = data[6];
+    if heap_sizes > 7 {
+        return None;
+    }
+
+    // Reserved2 should be 1
+    let reserved2 = data[7];
+    if reserved2 != 1 {
+        return None;
+    }
+
+    // Valid mask - Module table (bit 0) should always be present
+    let valid = u64::from_le_bytes([
+        data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
+    ]);
+
+    // Module table (0x00) must be present
+    if valid & 1 == 0 {
+        return None;
+    }
+
+    // Count set bits to determine number of row counts
+    let table_count = valid.count_ones() as usize;
+    if table_count == 0 || table_count > 64 {
+        return None;
+    }
+
+    // Check that we have enough space for row counts
+    let row_counts_start = 24;
+    let row_counts_size = table_count * 4;
+    if offset + row_counts_start + row_counts_size > metadata.len() {
+        return None;
+    }
+
+    // Validate row counts are reasonable
+    for i in 0..table_count {
+        let row_offset = row_counts_start + i * 4;
+        let row_count = u32::from_le_bytes([
+            data[row_offset],
+            data[row_offset + 1],
+            data[row_offset + 2],
+            data[row_offset + 3],
+        ]);
+
+        // Row counts should be reasonable (< 16 million)
+        if row_count > 0x1000000 {
+            return None;
+        }
+    }
+
+    // Calculate approximate stream size based on table data
+    // This is a rough estimate - actual size depends on table row sizes
+    let header_size = row_counts_start + row_counts_size;
+
+    // For now, estimate remaining size as the rest of metadata or a reasonable max
+    let remaining = metadata.len() - offset;
+    let estimated_size = remaining.min(0x100000); // Cap at 1MB
+
+    Some(estimated_size.max(header_size))
+}
+
+/// Scan for #Strings heap by looking for null-terminated ASCII strings.
+/// The #Strings heap starts with a null byte and contains null-terminated strings.
+pub fn scan_for_strings_heap(metadata: &[u8], start_after: usize) -> Option<(usize, usize)> {
+    if start_after >= metadata.len() {
+        return None;
+    }
+
+    // Look for a region that starts with 0x00 and contains printable ASCII
+    for offset in start_after..metadata.len().saturating_sub(16) {
+        // #Strings heap starts with a null byte (empty string at index 0)
+        if metadata[offset] != 0 {
+            continue;
+        }
+
+        // Check if following bytes look like null-terminated strings
+        let mut valid_strings = 0;
+        let mut pos = offset + 1;
+        let mut last_null = offset;
+
+        while pos < metadata.len() && pos < offset + 0x10000 {
+            let b = metadata[pos];
+
+            if b == 0 {
+                // End of a string
+                let str_len = pos - last_null - 1;
+                if str_len > 0 && str_len < 256 {
+                    valid_strings += 1;
+                }
+                last_null = pos;
+
+                if valid_strings >= 5 {
+                    // Found enough valid strings, estimate size
+                    let size = find_heap_end(metadata, offset);
+                    return Some((offset, size));
+                }
+            } else if !b.is_ascii() || (b < 0x20 && b != 0x09 && b != 0x0A && b != 0x0D) {
+                // Non-printable, non-whitespace character - probably not #Strings
+                break;
+            }
+
+            pos += 1;
+        }
+    }
+
+    None
+}
+
+/// Find the end of a heap by looking for padding or next structure.
+fn find_heap_end(metadata: &[u8], start: usize) -> usize {
+    // Look for a run of zeros that might indicate padding
+    let mut pos = start;
+    let mut zero_run = 0;
+
+    while pos < metadata.len() {
+        if metadata[pos] == 0 {
+            zero_run += 1;
+            if zero_run >= 4 {
+                // Found padding, heap ends here
+                return pos - zero_run + 1 - start;
+            }
+        } else {
+            zero_run = 0;
+        }
+        pos += 1;
+    }
+
+    metadata.len() - start
+}
+
+/// Reconstruct corrupted metadata by rebuilding the BSJB header and stream headers.
+/// This is used when the metadata signature or stream headers have been zeroed/corrupted.
+///
+/// # Arguments
+/// * `metadata` - Raw metadata bytes (may have corrupted header)
+/// * `streams` - Located stream information (from scanning or DAC)
+///
+/// # Returns
+/// Reconstructed metadata with valid BSJB header and stream headers
+pub fn reconstruct_metadata_header(metadata: &[u8], streams: &MetadataStreamLocations) -> Vec<u8> {
+    // Calculate sizes
+    let version_string = b"v4.0.30319\0\0"; // 12 bytes, padded to 4-byte boundary
+    let version_length = 12u32;
+
+    // Count active streams
+    let mut stream_count = 0u16;
+    if streams.tilde_size > 0 {
+        stream_count += 1;
+    }
+    if streams.strings_size > 0 {
+        stream_count += 1;
+    }
+    if streams.us_size > 0 {
+        stream_count += 1;
+    }
+    if streams.guid_size > 0 {
+        stream_count += 1;
+    }
+    if streams.blob_size > 0 {
+        stream_count += 1;
+    }
+
+    // Calculate header size
+    // STORAGESIGNATURE: 16 + version_length bytes
+    // STORAGEHEADER: 4 bytes
+    // Stream headers: variable (8 bytes + name aligned to 4)
+    let storage_sig_size = 16 + version_length as usize;
+    let storage_header_size = 4;
+
+    // Stream header sizes (offset:4 + size:4 + name aligned to 4)
+    let tilde_header_size = if streams.tilde_size > 0 {
+        8 + if streams.is_compressed { 4 } else { 4 }
+    } else {
+        0
+    }; // "#~\0\0" or "#-\0\0"
+    let strings_header_size = if streams.strings_size > 0 { 8 + 12 } else { 0 }; // "#Strings\0" padded
+    let us_header_size = if streams.us_size > 0 { 8 + 4 } else { 0 }; // "#US\0"
+    let guid_header_size = if streams.guid_size > 0 { 8 + 8 } else { 0 }; // "#GUID\0" padded
+    let blob_header_size = if streams.blob_size > 0 { 8 + 8 } else { 0 }; // "#Blob\0" padded
+
+    let total_header_size = storage_sig_size
+        + storage_header_size
+        + tilde_header_size
+        + strings_header_size
+        + us_header_size
+        + guid_header_size
+        + blob_header_size;
+
+    // Calculate new stream offsets (relative to metadata start)
+    let new_tilde_offset = total_header_size;
+    let new_strings_offset = new_tilde_offset + streams.tilde_size;
+    let new_us_offset = new_strings_offset + streams.strings_size;
+    let new_guid_offset = new_us_offset + streams.us_size;
+    let new_blob_offset = new_guid_offset + streams.guid_size;
+    let total_size = new_blob_offset + streams.blob_size;
+
+    let mut result = vec![0u8; total_size];
+
+    // Write STORAGESIGNATURE
+    result[0..4].copy_from_slice(b"BSJB"); // lSignature
+    result[4..6].copy_from_slice(&1u16.to_le_bytes()); // iMajorVer
+    result[6..8].copy_from_slice(&1u16.to_le_bytes()); // iMinorVer
+    result[8..12].copy_from_slice(&0u32.to_le_bytes()); // iExtraData
+    result[12..16].copy_from_slice(&version_length.to_le_bytes()); // iVersionString
+    result[16..16 + version_string.len()].copy_from_slice(version_string);
+
+    // Write STORAGEHEADER
+    let storage_header_offset = storage_sig_size;
+    result[storage_header_offset] = 0; // fFlags
+    result[storage_header_offset + 1] = 0; // pad
+    result[storage_header_offset + 2..storage_header_offset + 4]
+        .copy_from_slice(&stream_count.to_le_bytes()); // iStreams
+
+    // Write stream headers
+    let mut header_pos = storage_header_offset + storage_header_size;
+
+    // #~ or #- stream
+    if streams.tilde_size > 0 {
+        result[header_pos..header_pos + 4]
+            .copy_from_slice(&(new_tilde_offset as u32).to_le_bytes());
+        result[header_pos + 4..header_pos + 8]
+            .copy_from_slice(&(streams.tilde_size as u32).to_le_bytes());
+        if streams.is_compressed {
+            result[header_pos + 8..header_pos + 12].copy_from_slice(b"#~\0\0");
+        } else {
+            result[header_pos + 8..header_pos + 12].copy_from_slice(b"#-\0\0");
+        }
+        header_pos += tilde_header_size;
+    }
+
+    // #Strings stream
+    if streams.strings_size > 0 {
+        result[header_pos..header_pos + 4]
+            .copy_from_slice(&(new_strings_offset as u32).to_le_bytes());
+        result[header_pos + 4..header_pos + 8]
+            .copy_from_slice(&(streams.strings_size as u32).to_le_bytes());
+        result[header_pos + 8..header_pos + 17].copy_from_slice(b"#Strings\0");
+        // Pad to 4 bytes (name is 9 bytes, pad to 12)
+        header_pos += strings_header_size;
+    }
+
+    // #US stream
+    if streams.us_size > 0 {
+        result[header_pos..header_pos + 4]
+            .copy_from_slice(&(new_us_offset as u32).to_le_bytes());
+        result[header_pos + 4..header_pos + 8]
+            .copy_from_slice(&(streams.us_size as u32).to_le_bytes());
+        result[header_pos + 8..header_pos + 12].copy_from_slice(b"#US\0");
+        header_pos += us_header_size;
+    }
+
+    // #GUID stream
+    if streams.guid_size > 0 {
+        result[header_pos..header_pos + 4]
+            .copy_from_slice(&(new_guid_offset as u32).to_le_bytes());
+        result[header_pos + 4..header_pos + 8]
+            .copy_from_slice(&(streams.guid_size as u32).to_le_bytes());
+        result[header_pos + 8..header_pos + 14].copy_from_slice(b"#GUID\0");
+        // Pad to 8 bytes
+        header_pos += guid_header_size;
+    }
+
+    // #Blob stream
+    if streams.blob_size > 0 {
+        result[header_pos..header_pos + 4]
+            .copy_from_slice(&(new_blob_offset as u32).to_le_bytes());
+        result[header_pos + 4..header_pos + 8]
+            .copy_from_slice(&(streams.blob_size as u32).to_le_bytes());
+        result[header_pos + 8..header_pos + 14].copy_from_slice(b"#Blob\0");
+        // Pad to 8 bytes
+    }
+
+    // Copy stream data
+    if streams.tilde_size > 0 && streams.tilde_offset + streams.tilde_size <= metadata.len() {
+        let src = &metadata[streams.tilde_offset..streams.tilde_offset + streams.tilde_size];
+        let dst_end = (new_tilde_offset + streams.tilde_size).min(result.len());
+        let copy_len = (dst_end - new_tilde_offset).min(src.len());
+        result[new_tilde_offset..new_tilde_offset + copy_len].copy_from_slice(&src[..copy_len]);
+    }
+
+    if streams.strings_size > 0 && streams.strings_offset + streams.strings_size <= metadata.len()
+    {
+        let src =
+            &metadata[streams.strings_offset..streams.strings_offset + streams.strings_size];
+        let dst_end = (new_strings_offset + streams.strings_size).min(result.len());
+        let copy_len = (dst_end - new_strings_offset).min(src.len());
+        result[new_strings_offset..new_strings_offset + copy_len].copy_from_slice(&src[..copy_len]);
+    }
+
+    if streams.us_size > 0 && streams.us_offset + streams.us_size <= metadata.len() {
+        let src = &metadata[streams.us_offset..streams.us_offset + streams.us_size];
+        let dst_end = (new_us_offset + streams.us_size).min(result.len());
+        let copy_len = (dst_end - new_us_offset).min(src.len());
+        result[new_us_offset..new_us_offset + copy_len].copy_from_slice(&src[..copy_len]);
+    }
+
+    if streams.guid_size > 0 && streams.guid_offset + streams.guid_size <= metadata.len() {
+        let src = &metadata[streams.guid_offset..streams.guid_offset + streams.guid_size];
+        let dst_end = (new_guid_offset + streams.guid_size).min(result.len());
+        let copy_len = (dst_end - new_guid_offset).min(src.len());
+        result[new_guid_offset..new_guid_offset + copy_len].copy_from_slice(&src[..copy_len]);
+    }
+
+    if streams.blob_size > 0 && streams.blob_offset + streams.blob_size <= metadata.len() {
+        let src = &metadata[streams.blob_offset..streams.blob_offset + streams.blob_size];
+        let dst_end = (new_blob_offset + streams.blob_size).min(result.len());
+        let copy_len = (dst_end - new_blob_offset).min(src.len());
+        result[new_blob_offset..new_blob_offset + copy_len].copy_from_slice(&src[..copy_len]);
+    }
+
+    result
+}
+
+/// Try to repair corrupted metadata by scanning for streams and rebuilding headers.
+/// Returns the repaired metadata if successful, or None if repair failed.
+pub fn try_repair_metadata(metadata: &[u8]) -> Option<Vec<u8>> {
+    // First, check if metadata is actually corrupted
+    if metadata.len() >= 4 && &metadata[0..4] == b"BSJB" {
+        // BSJB signature is intact, try to parse normally
+        if parse_metadata_streams(metadata).is_some() {
+            // Metadata is fine, no repair needed
+            return None;
+        }
+    }
+
+    // Scan for #~ stream
+    let (tilde_offset, tilde_size) = scan_for_tilde_stream(metadata)?;
+
+    // Scan for #Strings heap (should be after #~ stream typically)
+    let (strings_offset, strings_size) =
+        scan_for_strings_heap(metadata, tilde_offset + tilde_size).unwrap_or((0, 0));
+
+    // Build stream locations
+    let streams = MetadataStreamLocations {
+        tilde_offset,
+        tilde_size,
+        is_compressed: true, // Assume compressed for now
+        strings_offset,
+        strings_size,
+        us_offset: 0,
+        us_size: 0,
+        guid_offset: 0,
+        guid_size: 0,
+        blob_offset: 0,
+        blob_size: 0,
+    };
+
+    // Reconstruct metadata
+    Some(reconstruct_metadata_header(metadata, &streams))
+}
+
+/// Parse metadata streams from valid metadata.
+/// Returns stream locations if parsing succeeds.
+fn parse_metadata_streams(metadata: &[u8]) -> Option<MetadataStreamLocations> {
+    if metadata.len() < 16 || &metadata[0..4] != b"BSJB" {
+        return None;
+    }
+
+    let version_length =
+        u32::from_le_bytes([metadata[12], metadata[13], metadata[14], metadata[15]]) as usize;
+    let version_padded = (version_length + 3) & !3;
+    let streams_offset = 16 + version_padded;
+
+    if streams_offset + 4 > metadata.len() {
+        return None;
+    }
+
+    let num_streams =
+        u16::from_le_bytes([metadata[streams_offset + 2], metadata[streams_offset + 3]]) as usize;
+
+    let mut locations = MetadataStreamLocations::default();
+    let mut pos = streams_offset + 4;
+
+    for _ in 0..num_streams {
+        if pos + 8 > metadata.len() {
+            break;
+        }
+
+        let stream_offset = u32::from_le_bytes([
+            metadata[pos],
+            metadata[pos + 1],
+            metadata[pos + 2],
+            metadata[pos + 3],
+        ]) as usize;
+        let stream_size = u32::from_le_bytes([
+            metadata[pos + 4],
+            metadata[pos + 5],
+            metadata[pos + 6],
+            metadata[pos + 7],
+        ]) as usize;
+
+        pos += 8;
+
+        // Read stream name
+        let name_start = pos;
+        while pos < metadata.len() && metadata[pos] != 0 {
+            pos += 1;
+        }
+        let name = std::str::from_utf8(&metadata[name_start..pos]).unwrap_or("");
+        pos += 1;
+        pos = (pos + 3) & !3;
+
+        match name {
+            "#~" => {
+                locations.tilde_offset = stream_offset;
+                locations.tilde_size = stream_size;
+                locations.is_compressed = true;
+            }
+            "#-" => {
+                locations.tilde_offset = stream_offset;
+                locations.tilde_size = stream_size;
+                locations.is_compressed = false;
+            }
+            "#Strings" => {
+                locations.strings_offset = stream_offset;
+                locations.strings_size = stream_size;
+            }
+            "#US" => {
+                locations.us_offset = stream_offset;
+                locations.us_size = stream_size;
+            }
+            "#GUID" => {
+                locations.guid_offset = stream_offset;
+                locations.guid_size = stream_size;
+            }
+            "#Blob" => {
+                locations.blob_offset = stream_offset;
+                locations.blob_size = stream_size;
+            }
+            _ => {}
+        }
+    }
+
+    if locations.tilde_size > 0 {
+        Some(locations)
+    } else {
+        None
+    }
+}
+
+/// Repair metadata within a PE file by replacing corrupted metadata with good metadata.
+/// This is used when PE headers are valid but metadata is corrupted.
+///
+/// # Arguments
+/// * `pe_data` - The PE file data (may have corrupted metadata)
+/// * `good_metadata` - Valid metadata to replace the corrupted metadata with
+///
+/// # Returns
+/// Repaired PE data with valid metadata, or None if repair failed
+pub fn repair_pe_metadata(pe_data: &[u8], good_metadata: &[u8]) -> Option<Vec<u8>> {
+    // Parse DOS header
+    if pe_data.len() < 64 || pe_data[0] != b'M' || pe_data[1] != b'Z' {
+        return None;
+    }
+
+    let e_lfanew =
+        u32::from_le_bytes([pe_data[0x3C], pe_data[0x3D], pe_data[0x3E], pe_data[0x3F]]) as usize;
+
+    if e_lfanew + 24 > pe_data.len() {
+        return None;
+    }
+
+    // Check PE signature
+    if pe_data.get(e_lfanew..e_lfanew + 4) != Some(b"PE\0\0".as_slice()) {
+        return None;
+    }
+
+    // Parse COFF header
+    let coff_offset = e_lfanew + 4;
+    let size_of_optional_header =
+        u16::from_le_bytes([pe_data[coff_offset + 16], pe_data[coff_offset + 17]]) as usize;
+
+    if size_of_optional_header == 0 {
+        return None;
+    }
+
+    // Parse optional header to find CLI header data directory
+    let opt_offset = coff_offset + 20;
+    let magic = u16::from_le_bytes([pe_data[opt_offset], pe_data[opt_offset + 1]]);
+
+    let is_pe32_plus = magic == 0x20b;
+    let data_dir_offset = if is_pe32_plus {
+        opt_offset + 112
+    } else {
+        opt_offset + 96
+    };
+
+    // CLI header is data directory entry 14
+    let cli_dir_offset = data_dir_offset + 14 * 8;
+    if cli_dir_offset + 8 > pe_data.len() {
+        return None;
+    }
+
+    let cli_rva = u32::from_le_bytes([
+        pe_data[cli_dir_offset],
+        pe_data[cli_dir_offset + 1],
+        pe_data[cli_dir_offset + 2],
+        pe_data[cli_dir_offset + 3],
+    ]);
+
+    if cli_rva == 0 {
+        return None;
+    }
+
+    // Convert RVA to file offset
+    let cli_offset = rva_to_file_offset(pe_data, e_lfanew, cli_rva as usize)?;
+
+    if cli_offset + 16 > pe_data.len() {
+        return None;
+    }
+
+    let metadata_rva = u32::from_le_bytes([
+        pe_data[cli_offset + 8],
+        pe_data[cli_offset + 9],
+        pe_data[cli_offset + 10],
+        pe_data[cli_offset + 11],
+    ]) as usize;
+
+    let old_metadata_size = u32::from_le_bytes([
+        pe_data[cli_offset + 12],
+        pe_data[cli_offset + 13],
+        pe_data[cli_offset + 14],
+        pe_data[cli_offset + 15],
+    ]) as usize;
+
+    if metadata_rva == 0 {
+        return None;
+    }
+
+    let metadata_offset = rva_to_file_offset(pe_data, e_lfanew, metadata_rva)?;
+
+    // Create repaired PE
+    let mut result = pe_data.to_vec();
+
+    // If the new metadata fits in the old space, just replace it
+    if good_metadata.len() <= old_metadata_size && metadata_offset + good_metadata.len() <= result.len() {
+        // Replace metadata in place
+        result[metadata_offset..metadata_offset + good_metadata.len()]
+            .copy_from_slice(good_metadata);
+
+        // Zero out remaining space if new metadata is smaller
+        if good_metadata.len() < old_metadata_size {
+            let remaining = old_metadata_size - good_metadata.len();
+            let end = (metadata_offset + old_metadata_size).min(result.len());
+            let start = metadata_offset + good_metadata.len();
+            if start < end {
+                result[start..end].fill(0);
+            }
+        }
+
+        // Update metadata size in CLI header
+        let new_size_bytes = (good_metadata.len() as u32).to_le_bytes();
+        result[cli_offset + 12..cli_offset + 16].copy_from_slice(&new_size_bytes);
+
+        Some(result)
+    } else {
+        // New metadata is larger - need to append it
+        // This is more complex as we need to update RVAs
+        // For now, return None and fall back to full reconstruction
+        None
+    }
+}
+
+// =============================================================================
 // .NET Metadata Parsing - Assembly Name Extraction
 // =============================================================================
 
