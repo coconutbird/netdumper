@@ -1911,8 +1911,7 @@ pub fn reconstruct_metadata_header(metadata: &[u8], streams: &MetadataStreamLoca
 
     // #US stream
     if streams.us_size > 0 {
-        result[header_pos..header_pos + 4]
-            .copy_from_slice(&(new_us_offset as u32).to_le_bytes());
+        result[header_pos..header_pos + 4].copy_from_slice(&(new_us_offset as u32).to_le_bytes());
         result[header_pos + 4..header_pos + 8]
             .copy_from_slice(&(streams.us_size as u32).to_le_bytes());
         result[header_pos + 8..header_pos + 12].copy_from_slice(b"#US\0");
@@ -1921,8 +1920,7 @@ pub fn reconstruct_metadata_header(metadata: &[u8], streams: &MetadataStreamLoca
 
     // #GUID stream
     if streams.guid_size > 0 {
-        result[header_pos..header_pos + 4]
-            .copy_from_slice(&(new_guid_offset as u32).to_le_bytes());
+        result[header_pos..header_pos + 4].copy_from_slice(&(new_guid_offset as u32).to_le_bytes());
         result[header_pos + 4..header_pos + 8]
             .copy_from_slice(&(streams.guid_size as u32).to_le_bytes());
         result[header_pos + 8..header_pos + 14].copy_from_slice(b"#GUID\0");
@@ -1932,8 +1930,7 @@ pub fn reconstruct_metadata_header(metadata: &[u8], streams: &MetadataStreamLoca
 
     // #Blob stream
     if streams.blob_size > 0 {
-        result[header_pos..header_pos + 4]
-            .copy_from_slice(&(new_blob_offset as u32).to_le_bytes());
+        result[header_pos..header_pos + 4].copy_from_slice(&(new_blob_offset as u32).to_le_bytes());
         result[header_pos + 4..header_pos + 8]
             .copy_from_slice(&(streams.blob_size as u32).to_le_bytes());
         result[header_pos + 8..header_pos + 14].copy_from_slice(b"#Blob\0");
@@ -1948,10 +1945,8 @@ pub fn reconstruct_metadata_header(metadata: &[u8], streams: &MetadataStreamLoca
         result[new_tilde_offset..new_tilde_offset + copy_len].copy_from_slice(&src[..copy_len]);
     }
 
-    if streams.strings_size > 0 && streams.strings_offset + streams.strings_size <= metadata.len()
-    {
-        let src =
-            &metadata[streams.strings_offset..streams.strings_offset + streams.strings_size];
+    if streams.strings_size > 0 && streams.strings_offset + streams.strings_size <= metadata.len() {
+        let src = &metadata[streams.strings_offset..streams.strings_offset + streams.strings_size];
         let dst_end = (new_strings_offset + streams.strings_size).min(result.len());
         let copy_len = (dst_end - new_strings_offset).min(src.len());
         result[new_strings_offset..new_strings_offset + copy_len].copy_from_slice(&src[..copy_len]);
@@ -2203,7 +2198,9 @@ pub fn repair_pe_metadata(pe_data: &[u8], good_metadata: &[u8]) -> Option<Vec<u8
     let mut result = pe_data.to_vec();
 
     // If the new metadata fits in the old space, just replace it
-    if good_metadata.len() <= old_metadata_size && metadata_offset + good_metadata.len() <= result.len() {
+    if good_metadata.len() <= old_metadata_size
+        && metadata_offset + good_metadata.len() <= result.len()
+    {
         // Replace metadata in place
         result[metadata_offset..metadata_offset + good_metadata.len()]
             .copy_from_slice(good_metadata);
@@ -2614,12 +2611,9 @@ fn extract_assembly_name_from_tilde_stream(tilde: &[u8], strings: &[u8]) -> Opti
 
     // Fall back to Module table
     if has_module_table {
-        if let Some(name) = extract_name_from_module_table(
-            tilde,
-            strings,
-            tables_start,
-            string_idx_size,
-        ) {
+        if let Some(name) =
+            extract_name_from_module_table(tilde, strings, tables_start, string_idx_size)
+        {
             return Some(name);
         }
     }

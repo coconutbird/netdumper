@@ -10,11 +10,11 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 
 use crate::pe::{
-    build_pe_from_metadata_with_il, build_pe_with_reconstructed_headers,
+    MetadataError, build_pe_from_metadata_with_il, build_pe_with_reconstructed_headers,
     convert_memory_to_file_layout, extract_assembly_name_from_metadata_debug,
     extract_entry_point_from_pe, extract_metadata_info, extract_method_rvas,
     is_pe_header_corrupted, read_pe_info, reconstruct_pe_info, repair_pe_metadata,
-    try_repair_metadata, validate_cli_header_in_memory, MetadataError,
+    try_repair_metadata, validate_cli_header_in_memory,
 };
 use crate::process::{enumerate_assemblies_external, read_il_bodies_for_module};
 use crate::target::ProcessInfo;
@@ -317,23 +317,23 @@ pub fn dump_assembly(
 
                 if read_ok {
                     // Try to repair DAC metadata if it's also corrupted
-                    let good_metadata =
-                        if dac_metadata.len() >= 4 && &dac_metadata[0..4] == b"BSJB" {
-                            Some(dac_metadata)
-                        } else if let Some(repaired) = try_repair_metadata(&dac_metadata) {
-                            eprintln!(
-                                "  [INFO] {} - DAC metadata reconstructed ({} bytes)",
-                                fallback_name,
-                                repaired.len()
-                            );
-                            Some(repaired)
-                        } else {
-                            eprintln!(
-                                "  [DEBUG] {} - DAC metadata also corrupted, cannot repair",
-                                fallback_name
-                            );
-                            None
-                        };
+                    let good_metadata = if dac_metadata.len() >= 4 && &dac_metadata[0..4] == b"BSJB"
+                    {
+                        Some(dac_metadata)
+                    } else if let Some(repaired) = try_repair_metadata(&dac_metadata) {
+                        eprintln!(
+                            "  [INFO] {} - DAC metadata reconstructed ({} bytes)",
+                            fallback_name,
+                            repaired.len()
+                        );
+                        Some(repaired)
+                    } else {
+                        eprintln!(
+                            "  [DEBUG] {} - DAC metadata also corrupted, cannot repair",
+                            fallback_name
+                        );
+                        None
+                    };
 
                     // Try to repair the PE with good metadata
                     if let Some(metadata) = good_metadata {
@@ -355,10 +355,7 @@ pub fn dump_assembly(
                         (file_image, fallback_name.clone())
                     }
                 } else {
-                    eprintln!(
-                        "  [DEBUG] {} - Failed to read DAC metadata",
-                        fallback_name
-                    );
+                    eprintln!("  [DEBUG] {} - Failed to read DAC metadata", fallback_name);
                     (file_image, fallback_name.clone())
                 }
             } else {
