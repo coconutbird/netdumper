@@ -1032,8 +1032,6 @@ impl DacModuleIndex {
 }
 
 impl EmbeddedRuntimeInfo {
-    const EXPECTED_SIGNATURE: &'static [u8] = b"DotNetRuntimeInfo\0";
-
     fn is_valid(&self) -> bool {
         self.signature.starts_with(b"DotNetRuntimeInfo")
     }
@@ -1049,10 +1047,6 @@ impl EmbeddedRuntimeInfo {
     }
     fn revision(&self) -> i32 {
         self.runtime_version[3]
-    }
-
-    fn version_string(&self) -> String {
-        format!("{}.{}.{}", self.major(), self.minor(), self.build())
     }
 
     /// Extract DAC module index information
@@ -1249,8 +1243,8 @@ fn get_embedded_clr_version_with_handle(handle: HANDLE) -> Option<EmbeddedRuntim
 
     // Parse COFF header (after 4-byte PE signature)
     // Number of sections at offset 6 in COFF
-    let num_sections = u16::from_le_bytes([pe_header[6], pe_header[7]]) as usize;
-    let optional_header_size = u16::from_le_bytes([pe_header[20], pe_header[21]]) as usize;
+    let _num_sections = u16::from_le_bytes([pe_header[6], pe_header[7]]) as usize;
+    let _optional_header_size = u16::from_le_bytes([pe_header[20], pe_header[21]]) as usize;
 
     // Optional header starts at offset 24 (after 4-byte PE sig + 20-byte COFF header)
     let opt_header_offset = 24usize;
