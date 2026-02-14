@@ -357,7 +357,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "portex"
 version = "0.1.0"
-source = "git+https://github.com/coconutbird/portex.git#41377464a10593f52303bb380dc293fba46c3715"
+source = "git+https://github.com/coconutbird/portex.git#63d2cc76abdc114a3c4f414c3e973fc53535bf35"
 
 [[package]]
 name = "proc-macro2"

@@ -361,9 +361,8 @@ pub fn build_pe_from_metadata(metadata: &[u8], is_64bit: bool) -> Vec<u8> {
     // Extract entry point and flags from metadata
     let (entry_point_token, cor_flags) = extract_metadata_info(metadata);
 
-    const COR20_SIZE: u32 = 72;
     const TEXT_RVA: u32 = 0x1000;
-    const METADATA_RVA: u32 = TEXT_RVA + COR20_SIZE;
+    const METADATA_RVA: u32 = TEXT_RVA + CliHeader::SIZE as u32;
 
     let metadata_size = metadata.len() as u32;
 
@@ -382,7 +381,7 @@ pub fn build_pe_from_metadata(metadata: &[u8], is_64bit: bool) -> Vec<u8> {
         entry_point_token == 0,
         &section_data,
         TEXT_RVA,
-        COR20_SIZE,
+        CliHeader::SIZE as u32,
     );
     pe.build()
 }
@@ -550,30 +549,17 @@ fn build_cor20_and_metadata(
     entry_point_token: u32,
     metadata: &[u8],
 ) -> Vec<u8> {
-    const COR20_SIZE: usize = 72;
+    let cli_header = CliHeader {
+        metadata_rva,
+        metadata_size,
+        flags: cor_flags,
+        entry_point_token_or_rva: entry_point_token,
+        ..Default::default()
+    };
 
-    let mut data = vec![0u8; COR20_SIZE + metadata.len()];
-
-    // COR20 Header (IMAGE_COR20_HEADER)
-    // cb = 72
-    data[0..4].copy_from_slice(&(COR20_SIZE as u32).to_le_bytes());
-    // MajorRuntimeVersion = 2
-    data[4..6].copy_from_slice(&2u16.to_le_bytes());
-    // MinorRuntimeVersion = 5
-    data[6..8].copy_from_slice(&5u16.to_le_bytes());
-    // MetaData RVA
-    data[8..12].copy_from_slice(&metadata_rva.to_le_bytes());
-    // MetaData Size
-    data[12..16].copy_from_slice(&metadata_size.to_le_bytes());
-    // Flags
-    data[16..20].copy_from_slice(&cor_flags.to_le_bytes());
-    // EntryPointToken
-    data[20..24].copy_from_slice(&entry_point_token.to_le_bytes());
-    // Rest of COR20 header fields are 0
-
-    // Copy metadata after COR20 header
-    data[COR20_SIZE..].copy_from_slice(metadata);
-
+    let mut data = Vec::with_capacity(CliHeader::SIZE + metadata.len());
+    data.extend_from_slice(&cli_header.to_bytes());
+    data.extend_from_slice(metadata);
     data
 }
 
@@ -597,8 +583,7 @@ pub fn build_pe_from_metadata_with_il(
     let (entry_point_token, cor_flags) = extract_metadata_info(metadata);
 
     const TEXT_RVA: u32 = 0x1000;
-    const COR20_SIZE: u32 = 72;
-    const METADATA_RVA: u32 = TEXT_RVA + COR20_SIZE;
+    const METADATA_RVA: u32 = TEXT_RVA + CliHeader::SIZE as u32;
 
     let metadata_size = metadata.len() as u32;
 
@@ -632,7 +617,7 @@ pub fn build_pe_from_metadata_with_il(
         entry_point_token == 0,
         &section_data,
         TEXT_RVA,
-        COR20_SIZE,
+        CliHeader::SIZE as u32,
     );
     pe.build()
 }
@@ -649,21 +634,21 @@ fn build_cor20_metadata_and_il(
     text_rva: u32,
     il_bodies: &[ILMethodBody],
 ) -> Vec<u8> {
-    const COR20_SIZE: usize = 72;
+    let cli_header = CliHeader {
+        metadata_rva,
+        metadata_size,
+        flags: cor_flags,
+        entry_point_token_or_rva: entry_point_token,
+        ..Default::default()
+    };
 
     let mut data = vec![0u8; section_size];
 
     // COR20 Header at offset 0 (RVA = text_rva)
-    data[0..4].copy_from_slice(&(COR20_SIZE as u32).to_le_bytes());
-    data[4..6].copy_from_slice(&2u16.to_le_bytes()); // MajorRuntimeVersion
-    data[6..8].copy_from_slice(&5u16.to_le_bytes()); // MinorRuntimeVersion
-    data[8..12].copy_from_slice(&metadata_rva.to_le_bytes());
-    data[12..16].copy_from_slice(&metadata_size.to_le_bytes());
-    data[16..20].copy_from_slice(&cor_flags.to_le_bytes());
-    data[20..24].copy_from_slice(&entry_point_token.to_le_bytes());
+    data[0..CliHeader::SIZE].copy_from_slice(&cli_header.to_bytes());
 
     // Metadata after COR20 header
-    let metadata_offset = COR20_SIZE;
+    let metadata_offset = CliHeader::SIZE;
     if metadata_offset + metadata.len() <= data.len() {
         data[metadata_offset..metadata_offset + metadata.len()].copy_from_slice(metadata);
     }
