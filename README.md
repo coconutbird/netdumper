@@ -10,7 +10,6 @@ A .NET assembly dumper for Windows that extracts assemblies from running process
   - Repairs BSJB metadata signatures and stream headers
   - Falls back to DAC metadata when PE metadata is destroyed
 - **PE layout conversion** - Properly converts CLR's in-memory PE layout back to valid file layout
-- **Machine type fix** - Corrects PE32+ headers with i386 machine type (CLR's AnyCPU quirk)
 - **Smart naming** - Extracts names from Assembly table → Module table → file path
 - **IL body recovery** - Recovers JIT'd method IL bodies via `GetILForModule`
 
@@ -83,7 +82,6 @@ When assemblies have corrupted headers (packers/protectors), netdumper:
 2. Detects zeroed BSJB signature → scans for #~ stream pattern
 3. Rebuilds metadata stream headers (#~, #Strings, #US, #GUID, #Blob)
 4. Falls back to DAC's metadata address when PE metadata is wrong
-5. Fixes CLR's PE32+ with i386 machine type to AMD64
 
 ## Requirements
 
