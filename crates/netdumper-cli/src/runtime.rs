@@ -927,7 +927,9 @@ fn check_dotnet_process_with_handle(
 }
 
 /// List all .NET processes on the system
+/// Uses parallel scanning for better performance on systems with many processes.
 pub fn list_dotnet_processes() -> Vec<DotNetProcessInfo> {
+    use rayon::prelude::*;
     use windows::Win32::System::ProcessStatus::EnumProcesses;
 
     let mut pids = [0u32; 4096];
@@ -946,38 +948,44 @@ pub fn list_dotnet_processes() -> Vec<DotNetProcessInfo> {
     }
 
     let count = bytes_returned as usize / std::mem::size_of::<u32>();
-    let mut dotnet_processes = Vec::new();
 
-    for &pid in &pids[..count] {
-        if pid == 0 {
-            continue;
-        }
+    // Filter out zero PIDs and collect into a Vec for parallel iteration
+    let valid_pids: Vec<u32> = pids[..count]
+        .iter()
+        .copied()
+        .filter(|&pid| pid != 0)
+        .collect();
 
-        // Try to open the process and get its name
-        let Ok(process) =
-            (unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) })
-        else {
-            continue;
-        };
-
-        let mut name_buf = [0u16; 260];
-        let name_len = unsafe { GetModuleBaseNameW(process, None, &mut name_buf) };
-
-        if name_len == 0 {
-            unsafe { CloseHandle(process).ok() };
-            continue;
-        }
-
-        let process_name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
-
-        if let Some(info) = check_dotnet_process_with_handle(pid, &process_name, process) {
-            dotnet_processes.push(info);
-        }
-
-        unsafe { CloseHandle(process).ok() };
-    }
+    // Scan processes in parallel
+    let mut dotnet_processes: Vec<DotNetProcessInfo> = valid_pids
+        .par_iter()
+        .filter_map(|&pid| check_single_process(pid))
+        .collect();
 
     // Sort by PID
     dotnet_processes.sort_by_key(|p| p.pid);
     dotnet_processes
+}
+
+/// Check if a single process is a .NET process (used for parallel scanning)
+fn check_single_process(pid: u32) -> Option<DotNetProcessInfo> {
+    // Try to open the process and get its name
+    let process =
+        unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }.ok()?;
+
+    let mut name_buf = [0u16; 260];
+    let name_len = unsafe { GetModuleBaseNameW(process, None, &mut name_buf) };
+
+    if name_len == 0 {
+        unsafe { CloseHandle(process).ok() };
+        return None;
+    }
+
+    let process_name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+
+    let result = check_dotnet_process_with_handle(pid, &process_name, process);
+
+    unsafe { CloseHandle(process).ok() };
+
+    result
 }
