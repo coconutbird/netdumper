@@ -3,6 +3,7 @@ mod dump;
 mod error;
 mod pe;
 mod process;
+mod reader;
 mod runtime;
 mod target;
 
@@ -68,8 +69,50 @@ fn main() {
 
     match cli.command {
         Commands::List => {
-            println!("Listing .NET processes...");
-            // TODO: Implement process listing
+            println!("Scanning for .NET processes...\n");
+
+            let processes = runtime::list_dotnet_processes();
+
+            if processes.is_empty() {
+                println!("No .NET processes found.");
+                println!("\nNote: Some processes may require administrator privileges to access.");
+            } else {
+                println!("{:<8} {:<40} {:<12} INFO", "PID", "NAME", "RUNTIME");
+                println!("{}", "-".repeat(80));
+
+                for proc in &processes {
+                    let runtime_str = match proc.runtime_type {
+                        Some(runtime::RuntimeType::Core) => ".NET Core",
+                        Some(runtime::RuntimeType::Framework) => ".NET Fx",
+                        Some(runtime::RuntimeType::FrameworkLegacy) => ".NET 2/3.5",
+                        None => "Unknown",
+                    };
+
+                    let info = if proc.is_embedded_clr {
+                        if let Some((major, minor, build, rev)) = proc.clr_version {
+                            format!("Single-file ({}.{}.{}.{})", major, minor, build, rev)
+                        } else {
+                            "Single-file".to_string()
+                        }
+                    } else {
+                        String::new()
+                    };
+
+                    println!(
+                        "{:<8} {:<40} {:<12} {}",
+                        proc.pid,
+                        if proc.name.len() > 40 {
+                            format!("{}...", &proc.name[..37])
+                        } else {
+                            proc.name.clone()
+                        },
+                        runtime_str,
+                        info
+                    );
+                }
+
+                println!("\nTotal: {} .NET process(es)", processes.len());
+            }
         }
         Commands::Enum { pid, name } => {
             let target_pid = match resolve_target(pid, name) {

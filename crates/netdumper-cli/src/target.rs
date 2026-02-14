@@ -178,8 +178,27 @@ impl ProcessInfo {
 
         let exe_base_address = if count > 0 { modules[0].0 as u64 } else { 0 };
 
-        // Read machine type from main module's PE header
-        let machine_type = if exe_base_address != 0 {
+        // Try to read machine type from CLR module first (more reliable for AnyCPU apps)
+        // Fall back to main module if CLR module not found
+        let clr_base_address = module_bases
+            .get("coreclr.dll")
+            .or_else(|| module_bases.get("clr.dll"))
+            .or_else(|| module_bases.get("mscorwks.dll"))
+            .copied();
+
+        let machine_type = if let Some(clr_base) = clr_base_address {
+            // Read from CLR module - this is the actual runtime architecture
+            read_machine_type_from_process(handle.as_raw(), clr_base as usize)
+                .unwrap_or_else(|| {
+                    // Fall back to main exe
+                    if exe_base_address != 0 {
+                        read_machine_type_from_process(handle.as_raw(), exe_base_address as usize)
+                            .unwrap_or(default_machine_type())
+                    } else {
+                        default_machine_type()
+                    }
+                })
+        } else if exe_base_address != 0 {
             read_machine_type_from_process(handle.as_raw(), exe_base_address as usize)
                 .unwrap_or(default_machine_type())
         } else {

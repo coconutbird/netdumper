@@ -829,3 +829,178 @@ pub fn get_embedded_clr_version_with_handle(handle: HANDLE) -> Option<EmbeddedRu
 
     None
 }
+
+// =============================================================================
+// Process Listing
+// =============================================================================
+
+/// Information about a .NET process
+#[derive(Debug, Clone)]
+pub struct DotNetProcessInfo {
+    /// Process ID
+    pub pid: u32,
+    /// Process name (e.g., "MyApp.exe")
+    pub name: String,
+    /// Runtime type if detected
+    pub runtime_type: Option<RuntimeType>,
+    /// Whether this is a single-file app with embedded CLR
+    pub is_embedded_clr: bool,
+    /// CLR version if available (major, minor, build, revision)
+    pub clr_version: Option<(i32, i32, i32, i32)>,
+}
+
+/// Check if a process is a .NET process (lightweight check)
+/// Returns Some(DotNetProcessInfo) if it's a .NET process, None otherwise
+#[allow(dead_code)]
+pub fn check_dotnet_process(pid: u32, process_name: &str) -> Option<DotNetProcessInfo> {
+    let handle =
+        unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }.ok()?;
+
+    let result = check_dotnet_process_with_handle(pid, process_name, handle);
+    unsafe { CloseHandle(handle).ok() };
+    result
+}
+
+/// Check if a process is .NET using an existing handle
+fn check_dotnet_process_with_handle(
+    pid: u32,
+    process_name: &str,
+    handle: HANDLE,
+) -> Option<DotNetProcessInfo> {
+    let mut modules = [windows::Win32::Foundation::HMODULE::default(); 1024];
+    let mut needed = 0u32;
+
+    if unsafe {
+        EnumProcessModulesEx(
+            handle,
+            modules.as_mut_ptr(),
+            std::mem::size_of_val(&modules) as u32,
+            &mut needed,
+            LIST_MODULES_ALL,
+        )
+    }
+    .is_err()
+    {
+        return None;
+    }
+
+    let count = needed as usize / std::mem::size_of::<windows::Win32::Foundation::HMODULE>();
+
+    // Check for CLR DLLs
+    let clr_dlls = [
+        ("coreclr.dll", RuntimeType::Core),
+        ("clr.dll", RuntimeType::Framework),
+        ("mscorwks.dll", RuntimeType::FrameworkLegacy),
+    ];
+
+    let mut exe_path: Option<PathBuf> = None;
+
+    for (i, &module) in modules.iter().enumerate().take(count) {
+        let mut name_buf = [0u16; 260];
+        let name_len = unsafe { GetModuleBaseNameW(handle, Some(module), &mut name_buf) };
+
+        if name_len > 0 {
+            let module_name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+            let module_lower = module_name.to_lowercase();
+
+            // Get exe path for first module (main executable)
+            if i == 0 {
+                let mut path_buf = [0u16; 512];
+                let path_len =
+                    unsafe { GetModuleFileNameExW(Some(handle), Some(module), &mut path_buf) };
+                if path_len > 0 {
+                    exe_path = Some(PathBuf::from(String::from_utf16_lossy(
+                        &path_buf[..path_len as usize],
+                    )));
+                }
+            }
+
+            // Check for CLR DLLs
+            for (clr_dll, runtime_type) in &clr_dlls {
+                if module_lower == *clr_dll {
+                    return Some(DotNetProcessInfo {
+                        pid,
+                        name: process_name.to_string(),
+                        runtime_type: Some(*runtime_type),
+                        is_embedded_clr: false,
+                        clr_version: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // Check for embedded CLR (single-file apps)
+    if let Some(ref path) = exe_path
+        && exe_has_clr_exports(path)
+    {
+        let clr_version = get_embedded_clr_version_with_handle(handle)
+            .map(|info| (info.major(), info.minor(), info.build(), info.revision()));
+
+        return Some(DotNetProcessInfo {
+            pid,
+            name: process_name.to_string(),
+            runtime_type: Some(RuntimeType::Core),
+            is_embedded_clr: true,
+            clr_version,
+        });
+    }
+
+    None
+}
+
+/// List all .NET processes on the system
+pub fn list_dotnet_processes() -> Vec<DotNetProcessInfo> {
+    use windows::Win32::System::ProcessStatus::EnumProcesses;
+
+    let mut pids = [0u32; 4096];
+    let mut bytes_returned: u32 = 0;
+
+    if unsafe {
+        EnumProcesses(
+            pids.as_mut_ptr(),
+            (pids.len() * std::mem::size_of::<u32>()) as u32,
+            &mut bytes_returned,
+        )
+    }
+    .is_err()
+    {
+        return Vec::new();
+    }
+
+    let count = bytes_returned as usize / std::mem::size_of::<u32>();
+    let mut dotnet_processes = Vec::new();
+
+    for &pid in &pids[..count] {
+        if pid == 0 {
+            continue;
+        }
+
+        // Try to open the process and get its name
+        let Ok(process) =
+            (unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) })
+        else {
+            continue;
+        };
+
+        let mut name_buf = [0u16; 260];
+        let name_len = unsafe { GetModuleBaseNameW(process, None, &mut name_buf) };
+
+        if name_len == 0 {
+            unsafe { CloseHandle(process).ok() };
+            continue;
+        }
+
+        let process_name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+
+        if let Some(info) = check_dotnet_process_with_handle(pid, &process_name, process) {
+            dotnet_processes.push(info);
+        }
+
+        unsafe { CloseHandle(process).ok() };
+    }
+
+    // Sort by PID
+    dotnet_processes.sort_by_key(|p| p.pid);
+    dotnet_processes
+}

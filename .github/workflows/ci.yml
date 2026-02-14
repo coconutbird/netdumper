@@ -15,11 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-          targets: ${{ matrix.target }}
+      - uses: jdx/mise-action@v2
 
       - name: Cache cargo
         uses: actions/cache@v4

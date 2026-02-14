@@ -7,6 +7,13 @@
 use std::ffi::c_void;
 
 use crate::assembly::AssemblyMetadata;
+use crate::reader::ProcessMemoryReader;
+use portex::coff::{CoffHeader, characteristics as coff_chars};
+use portex::data_dir::{DataDirectory, DataDirectoryType};
+use portex::dos::DosHeader;
+use portex::optional::{OptionalHeader, OptionalHeader32, OptionalHeader64, dll_characteristics};
+use portex::section::{Section, characteristics as sec_chars};
+use portex::{PE, PEHeaders};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQueryEx};
@@ -49,143 +56,94 @@ pub struct MemoryRegion {
 }
 
 // =============================================================================
+// Helper Functions for PE Parsing with Portex
+// =============================================================================
+
+/// CLI header information extracted from PE
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct CliHeaderInfo {
+    /// RVA of the CLI header
+    pub cli_rva: u32,
+    /// Size of the CLI header
+    pub cli_size: u32,
+    /// File offset of the CLI header (if conversion succeeded)
+    pub cli_file_offset: Option<u32>,
+    /// Whether this is PE32+ (64-bit)
+    pub is_pe32_plus: bool,
+}
+
+/// Parse CLI data directory information from a PE byte slice using portex.
+/// Returns the CLI RVA, size, and optional file offset.
+pub fn get_cli_directory_from_slice(pe_data: &[u8]) -> Option<CliHeaderInfo> {
+    let headers = PEHeaders::from_slice(pe_data).ok()?;
+
+    // Get CLI Runtime data directory (index 14)
+    let cli_dir = headers
+        .optional_header
+        .data_directories()
+        .get(DataDirectoryType::ClrRuntime.as_index())?;
+
+    if cli_dir.virtual_address == 0 {
+        return None;
+    }
+
+    // Try to convert RVA to file offset
+    let cli_file_offset = headers.rva_to_offset(cli_dir.virtual_address);
+
+    Some(CliHeaderInfo {
+        cli_rva: cli_dir.virtual_address,
+        cli_size: cli_dir.size,
+        cli_file_offset,
+        is_pe32_plus: headers.is_64bit(),
+    })
+}
+
+// =============================================================================
 // PE Header Reading
 // =============================================================================
 
-/// Read PE header information from a process
+/// Read PE header information from a process using portex.
 pub fn read_pe_info(process_handle: HANDLE, base_address: usize) -> Option<PeInfo> {
-    let mut dos_header = [0u8; 64];
-    let mut bytes_read = 0usize;
+    // Use ProcessMemoryReader with portex
+    let reader = ProcessMemoryReader::new(process_handle, base_address, None);
 
-    let result = unsafe {
-        ReadProcessMemory(
-            process_handle,
-            base_address as *const c_void,
-            dos_header.as_mut_ptr() as *mut c_void,
-            dos_header.len(),
-            Some(&mut bytes_read),
-        )
-    };
+    // Parse headers using portex
+    let headers = PEHeaders::read_from(&reader, 0).ok()?;
 
-    if result.is_err() || bytes_read < 64 {
-        return None;
-    }
-
-    if dos_header[0] != 0x4D || dos_header[1] != 0x5A {
-        return None;
-    }
-
-    let e_lfanew = u32::from_le_bytes([
-        dos_header[0x3C],
-        dos_header[0x3D],
-        dos_header[0x3E],
-        dos_header[0x3F],
-    ]);
-
-    if !(64..=1024).contains(&e_lfanew) {
-        return None;
-    }
-
-    let pe_header_offset = base_address + e_lfanew as usize;
-    let mut pe_header = [0u8; 264];
-
-    let result = unsafe {
-        ReadProcessMemory(
-            process_handle,
-            pe_header_offset as *const c_void,
-            pe_header.as_mut_ptr() as *mut c_void,
-            pe_header.len(),
-            Some(&mut bytes_read),
-        )
-    };
-
-    if result.is_err() || bytes_read < 264 {
-        return None;
-    }
-
-    if pe_header[0] != 0x50 || pe_header[1] != 0x45 || pe_header[2] != 0 || pe_header[3] != 0 {
-        return None;
-    }
-
-    // Machine type is at offset 4-5 in COFF header (after PE signature)
-    let machine_type = u16::from_le_bytes([pe_header[4], pe_header[5]]);
-    let number_of_sections = u16::from_le_bytes([pe_header[6], pe_header[7]]);
-    let size_of_optional_header = u16::from_le_bytes([pe_header[20], pe_header[21]]);
-
-    let optional_magic = u16::from_le_bytes([pe_header[24], pe_header[25]]);
-    let is_pe32_plus = optional_magic == 0x20b;
-
-    let size_of_image =
-        u32::from_le_bytes([pe_header[80], pe_header[81], pe_header[82], pe_header[83]]);
-    let size_of_headers =
-        u32::from_le_bytes([pe_header[84], pe_header[85], pe_header[86], pe_header[87]]);
-
+    // Validate size_of_image
+    let size_of_image = headers.optional_header.size_of_image();
     if !(0x1000..=0x40000000).contains(&size_of_image) {
         return None;
     }
+
+    // Validate section count
+    let number_of_sections = headers.coff_header.number_of_sections;
     if number_of_sections > 96 {
         return None;
     }
 
-    // Read section headers
-    let section_table_offset = pe_header_offset + 24 + size_of_optional_header as usize;
-    let section_table_size = number_of_sections as usize * 40;
-    let mut section_data = vec![0u8; section_table_size];
-
-    let result = unsafe {
-        ReadProcessMemory(
-            process_handle,
-            section_table_offset as *const c_void,
-            section_data.as_mut_ptr() as *mut c_void,
-            section_table_size,
-            Some(&mut bytes_read),
-        )
-    };
-
-    if result.is_err() || bytes_read < section_table_size {
-        return None;
-    }
-
-    let mut sections = Vec::with_capacity(number_of_sections as usize);
-    for i in 0..number_of_sections as usize {
-        let offset = i * 40;
-        sections.push(SectionInfo {
-            virtual_size: u32::from_le_bytes([
-                section_data[offset + 8],
-                section_data[offset + 9],
-                section_data[offset + 10],
-                section_data[offset + 11],
-            ]),
-            virtual_address: u32::from_le_bytes([
-                section_data[offset + 12],
-                section_data[offset + 13],
-                section_data[offset + 14],
-                section_data[offset + 15],
-            ]),
-            size_of_raw_data: u32::from_le_bytes([
-                section_data[offset + 16],
-                section_data[offset + 17],
-                section_data[offset + 18],
-                section_data[offset + 19],
-            ]),
-            pointer_to_raw_data: u32::from_le_bytes([
-                section_data[offset + 20],
-                section_data[offset + 21],
-                section_data[offset + 22],
-                section_data[offset + 23],
-            ]),
-        });
-    }
+    // Convert portex section headers to our SectionInfo format
+    let sections: Vec<SectionInfo> = headers
+        .section_headers
+        .iter()
+        .map(|s| SectionInfo {
+            virtual_address: s.virtual_address,
+            virtual_size: s.virtual_size,
+            pointer_to_raw_data: s.pointer_to_raw_data,
+            size_of_raw_data: s.size_of_raw_data,
+        })
+        .collect();
 
     Some(PeInfo {
-        machine_type,
-        e_lfanew,
+        machine_type: headers.coff_header.machine,
+        e_lfanew: headers.dos_header.e_lfanew as u32,
         size_of_image,
-        size_of_headers,
+        size_of_headers: headers.optional_header.size_of_headers(),
         number_of_sections,
-        size_of_optional_header,
+        size_of_optional_header: headers.coff_header.size_of_optional_header,
         sections,
-        is_pe32_plus,
+        is_pe32_plus: headers.is_64bit(),
     })
 }
 
@@ -196,42 +154,29 @@ pub fn validate_cli_header_in_memory(
     base_address: usize,
     pe_info: &PeInfo,
 ) -> bool {
-    // Find the CLI header data directory
-    // In PE32, data directories start at optional header offset 96
-    // In PE32+, data directories start at optional header offset 112
-    // CLI header is data directory index 14
-
-    let pe_header_offset = base_address + pe_info.e_lfanew as usize;
-    let data_dir_base_offset = if pe_info.is_pe32_plus { 112 } else { 96 };
-    let cli_dir_offset = pe_header_offset + 24 + data_dir_base_offset + 14 * 8;
-
-    let mut cli_dir = [0u8; 8];
-    let mut bytes_read = 0usize;
-
-    let result = unsafe {
-        ReadProcessMemory(
-            process_handle,
-            cli_dir_offset as *const c_void,
-            cli_dir.as_mut_ptr() as *mut c_void,
-            8,
-            Some(&mut bytes_read),
-        )
+    // Use ProcessMemoryReader with portex to get CLI data directory
+    let reader = ProcessMemoryReader::new(process_handle, base_address, None);
+    let headers = match PEHeaders::read_from(&reader, 0) {
+        Ok(h) => h,
+        Err(_) => return false,
     };
 
-    if result.is_err() || bytes_read < 8 {
-        return false;
-    }
+    // Get CLI Runtime data directory (index 14)
+    let cli_dir = match headers
+        .optional_header
+        .data_directories()
+        .get(DataDirectoryType::ClrRuntime.as_index())
+    {
+        Some(dir) if dir.virtual_address != 0 && dir.size >= 72 => dir,
+        _ => return false,
+    };
 
-    let cli_rva = u32::from_le_bytes([cli_dir[0], cli_dir[1], cli_dir[2], cli_dir[3]]);
-    let cli_size = u32::from_le_bytes([cli_dir[4], cli_dir[5], cli_dir[6], cli_dir[7]]);
+    let cli_rva = cli_dir.virtual_address;
 
-    if cli_rva == 0 || cli_size < 72 {
-        return false;
-    }
-
-    // Read the CLI header from memory
+    // Read the CLI header from memory (still need direct read for content validation)
     let cli_header_addr = base_address + cli_rva as usize;
     let mut cli_header = [0u8; 16];
+    let mut bytes_read = 0usize;
 
     let result = unsafe {
         ReadProcessMemory(
@@ -287,97 +232,19 @@ pub fn validate_cli_header_in_memory(
 /// Extract entry point token from a PE file by reading the COR20 header.
 /// Returns the entry point token, or 0 if not found.
 pub fn extract_entry_point_from_pe(pe_data: &[u8]) -> u32 {
-    // Read e_lfanew from DOS header
-    if pe_data.len() < 0x40 {
-        return 0;
-    }
-    let e_lfanew =
-        u32::from_le_bytes([pe_data[0x3C], pe_data[0x3D], pe_data[0x3E], pe_data[0x3F]]) as usize;
-
-    // Verify PE signature
-    if pe_data.len() < e_lfanew + 4 || &pe_data[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
-        return 0;
-    }
-
-    // COFF header starts at e_lfanew + 4
-    // SizeOfOptionalHeader at offset 16 from COFF header
-    let coff_offset = e_lfanew + 4;
-    if pe_data.len() < coff_offset + 20 {
-        return 0;
-    }
-    let size_of_optional_header =
-        u16::from_le_bytes([pe_data[coff_offset + 16], pe_data[coff_offset + 17]]) as usize;
-
-    // Optional header starts at coff_offset + 20
-    let opt_offset = coff_offset + 20;
-    if pe_data.len() < opt_offset + 2 {
-        return 0;
-    }
-    let magic = u16::from_le_bytes([pe_data[opt_offset], pe_data[opt_offset + 1]]);
-
-    // Data directories start after the standard/Windows-specific fields
-    // PE32 (0x10B): data dirs start at offset 96 from optional header
-    // PE32+ (0x20B): data dirs start at offset 112 from optional header
-    let data_dir_offset = match magic {
-        0x10B => opt_offset + 96,  // PE32
-        0x20B => opt_offset + 112, // PE32+
-        _ => return 0,
+    // Use portex helper to get CLI directory info
+    let cli_info = match get_cli_directory_from_slice(pe_data) {
+        Some(info) => info,
+        None => return 0,
     };
 
-    // CLR Runtime Header is data directory index 14
-    let clr_dir_offset = data_dir_offset + 14 * 8;
-    if pe_data.len() < clr_dir_offset + 8 {
-        return 0;
-    }
-    let clr_rva = u32::from_le_bytes([
-        pe_data[clr_dir_offset],
-        pe_data[clr_dir_offset + 1],
-        pe_data[clr_dir_offset + 2],
-        pe_data[clr_dir_offset + 3],
-    ]);
+    // Get CLI file offset (using portex's RVA-to-offset conversion)
+    let clr_file_offset = match cli_info.cli_file_offset {
+        Some(offset) => offset as usize,
+        None => return 0,
+    };
 
-    if clr_rva == 0 {
-        return 0;
-    }
-
-    // Convert RVA to file offset (simple: for our reconstructed PEs, .text is at 0x1000 and file offset 0x200)
-    // For real PEs, we'd need to walk section headers
-    let sections_offset = opt_offset + size_of_optional_header;
-    let num_sections =
-        u16::from_le_bytes([pe_data[coff_offset + 2], pe_data[coff_offset + 3]]) as usize;
-
-    let mut clr_file_offset = 0usize;
-    for i in 0..num_sections {
-        let section_offset = sections_offset + i * 40;
-        if pe_data.len() < section_offset + 40 {
-            break;
-        }
-        let virt_addr = u32::from_le_bytes([
-            pe_data[section_offset + 12],
-            pe_data[section_offset + 13],
-            pe_data[section_offset + 14],
-            pe_data[section_offset + 15],
-        ]);
-        let virt_size = u32::from_le_bytes([
-            pe_data[section_offset + 8],
-            pe_data[section_offset + 9],
-            pe_data[section_offset + 10],
-            pe_data[section_offset + 11],
-        ]);
-        let raw_ptr = u32::from_le_bytes([
-            pe_data[section_offset + 20],
-            pe_data[section_offset + 21],
-            pe_data[section_offset + 22],
-            pe_data[section_offset + 23],
-        ]);
-
-        if clr_rva >= virt_addr && clr_rva < virt_addr + virt_size {
-            clr_file_offset = (raw_ptr + (clr_rva - virt_addr)) as usize;
-            break;
-        }
-    }
-
-    if clr_file_offset == 0 || pe_data.len() < clr_file_offset + 24 {
+    if pe_data.len() < clr_file_offset + 24 {
         return 0;
     }
 
@@ -868,185 +735,221 @@ pub fn extract_method_rvas(metadata: &[u8]) -> Vec<MethodRvaInfo> {
 pub fn build_pe_from_metadata(metadata: &[u8], is_64bit: bool) -> Vec<u8> {
     // Extract entry point and flags from metadata
     let (entry_point_token, cor_flags) = extract_metadata_info(metadata);
-    const FILE_ALIGNMENT: u32 = 0x200;
-    const SECTION_ALIGNMENT: u32 = 0x1000;
-    const SIZE_OF_HEADERS: u32 = 0x200;
-    const TEXT_RVA: u32 = 0x1000;
+
     const COR20_SIZE: u32 = 72;
-    const METADATA_RVA: u32 = TEXT_RVA + COR20_SIZE; // 0x1048
+    const TEXT_RVA: u32 = 0x1000;
+    const METADATA_RVA: u32 = TEXT_RVA + COR20_SIZE;
 
     let metadata_size = metadata.len() as u32;
-    let text_raw_size = COR20_SIZE + metadata_size;
-    let text_raw_size_aligned = (text_raw_size + FILE_ALIGNMENT - 1) & !(FILE_ALIGNMENT - 1);
-    let text_virtual_size = COR20_SIZE + metadata_size;
-    let size_of_image =
-        TEXT_RVA + ((text_virtual_size + SECTION_ALIGNMENT - 1) & !(SECTION_ALIGNMENT - 1));
 
-    let total_file_size = SIZE_OF_HEADERS as usize + text_raw_size_aligned as usize;
-    let mut pe = vec![0u8; total_file_size];
+    // Build COR20 header + metadata as section data
+    let section_data = build_cor20_and_metadata(
+        METADATA_RVA,
+        metadata_size,
+        cor_flags,
+        entry_point_token,
+        metadata,
+    );
 
-    // DOS Header (64 bytes)
-    pe[0] = 0x4D; // 'M'
-    pe[1] = 0x5A; // 'Z'
-    // e_lfanew at offset 0x3C = 0x80
-    pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+    // Build PE using portex
+    let pe = build_dotnet_pe(
+        is_64bit,
+        entry_point_token == 0,
+        &section_data,
+        TEXT_RVA,
+        COR20_SIZE,
+    );
+    pe.build()
+}
 
-    // DOS Stub (0x40-0x7F) - minimal "This program cannot be run in DOS mode"
-    // We'll leave it as zeros for simplicity
+/// Build a minimal .NET PE structure using portex.
+fn build_dotnet_pe(
+    is_64bit: bool,
+    is_dll: bool,
+    text_section_data: &[u8],
+    cli_rva: u32,
+    cli_size: u32,
+) -> PE {
+    const FILE_ALIGNMENT: u32 = 0x200;
+    const SECTION_ALIGNMENT: u32 = 0x1000;
 
-    // PE Signature at 0x80
-    pe[0x80] = 0x50; // 'P'
-    pe[0x81] = 0x45; // 'E'
-    pe[0x82] = 0x00;
-    pe[0x83] = 0x00;
+    // Create DOS header
+    let dos_header = DosHeader {
+        e_magic: 0x5A4D, // "MZ"
+        e_cblp: 0,
+        e_cp: 0,
+        e_crlc: 0,
+        e_cparhdr: 0,
+        e_minalloc: 0,
+        e_maxalloc: 0,
+        e_ss: 0,
+        e_sp: 0,
+        e_csum: 0,
+        e_ip: 0,
+        e_cs: 0,
+        e_lfarlc: 0,
+        e_ovno: 0,
+        e_res: [0; 4],
+        e_oemid: 0,
+        e_oeminfo: 0,
+        e_res2: [0; 10],
+        e_lfanew: 0x80,
+    };
 
-    // COFF Header (20 bytes at 0x84)
-    let machine = if is_64bit { 0x8664u16 } else { 0x014Cu16 }; // AMD64 or i386
-    pe[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
-    pe[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // NumberOfSections = 1
-    // TimeDateStamp, PointerToSymbolTable, NumberOfSymbols = 0
-    let size_of_optional_header: u16 = if is_64bit { 240 } else { 224 };
-    pe[0x94..0x96].copy_from_slice(&size_of_optional_header.to_le_bytes());
-    // Characteristics: EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
-    // Add DLL flag only if no entry point (it's a library)
-    let mut characteristics: u16 = 0x0002 | 0x0020; // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
-    if entry_point_token == 0 {
-        characteristics |= 0x2000; // IMAGE_FILE_DLL
+    // Machine type
+    let machine = if is_64bit { 0x8664 } else { 0x014C };
+
+    // COFF characteristics
+    let mut characteristics = coff_chars::EXECUTABLE_IMAGE | coff_chars::LARGE_ADDRESS_AWARE;
+    if is_dll {
+        characteristics |= coff_chars::DLL;
     }
-    pe[0x96..0x98].copy_from_slice(&characteristics.to_le_bytes());
 
-    // Optional Header starts at 0x98
-    let opt_base = 0x98usize;
+    // Create COFF header (will be updated by portex)
+    let coff_header = CoffHeader {
+        machine,
+        number_of_sections: 1,
+        time_date_stamp: 0,
+        pointer_to_symbol_table: 0,
+        number_of_symbols: 0,
+        size_of_optional_header: 0, // Will be set by portex
+        characteristics,
+    };
 
-    if is_64bit {
-        // PE32+ Magic
-        pe[opt_base..opt_base + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
-        // MajorLinkerVersion, MinorLinkerVersion
-        pe[opt_base + 2] = 14;
-        pe[opt_base + 3] = 0;
-        // SizeOfCode
-        pe[opt_base + 4..opt_base + 8].copy_from_slice(&text_raw_size_aligned.to_le_bytes());
-        // SizeOfInitializedData = 0
-        // SizeOfUninitializedData = 0
-        // AddressOfEntryPoint = 0 (pure IL assembly)
-        // BaseOfCode = TEXT_RVA
-        pe[opt_base + 20..opt_base + 24].copy_from_slice(&TEXT_RVA.to_le_bytes());
-        // ImageBase (8 bytes for PE32+) = 0x180000000
-        pe[opt_base + 24..opt_base + 32].copy_from_slice(&0x180000000u64.to_le_bytes());
-        // SectionAlignment
-        pe[opt_base + 32..opt_base + 36].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
-        // FileAlignment
-        pe[opt_base + 36..opt_base + 40].copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
-        // OS Version (6.0)
-        pe[opt_base + 40..opt_base + 42].copy_from_slice(&6u16.to_le_bytes());
-        pe[opt_base + 42..opt_base + 44].copy_from_slice(&0u16.to_le_bytes());
-        // Image Version = 0
-        // Subsystem Version (6.0)
-        pe[opt_base + 48..opt_base + 50].copy_from_slice(&6u16.to_le_bytes());
-        pe[opt_base + 50..opt_base + 52].copy_from_slice(&0u16.to_le_bytes());
-        // Win32VersionValue = 0
-        // SizeOfImage
-        pe[opt_base + 56..opt_base + 60].copy_from_slice(&size_of_image.to_le_bytes());
-        // SizeOfHeaders
-        pe[opt_base + 60..opt_base + 64].copy_from_slice(&SIZE_OF_HEADERS.to_le_bytes());
-        // CheckSum = 0
-        // Subsystem = WINDOWS_CUI (3)
-        pe[opt_base + 68..opt_base + 70].copy_from_slice(&3u16.to_le_bytes());
-        // DllCharacteristics: DYNAMIC_BASE | NX_COMPAT | NO_SEH | TERMINAL_SERVER_AWARE
-        let dll_chars: u16 = 0x0040 | 0x0100 | 0x0400 | 0x8000;
-        pe[opt_base + 70..opt_base + 72].copy_from_slice(&dll_chars.to_le_bytes());
-        // Stack/Heap sizes (8 bytes each for PE32+)
-        pe[opt_base + 72..opt_base + 80].copy_from_slice(&0x100000u64.to_le_bytes()); // SizeOfStackReserve
-        pe[opt_base + 80..opt_base + 88].copy_from_slice(&0x1000u64.to_le_bytes()); // SizeOfStackCommit
-        pe[opt_base + 88..opt_base + 96].copy_from_slice(&0x100000u64.to_le_bytes()); // SizeOfHeapReserve
-        pe[opt_base + 96..opt_base + 104].copy_from_slice(&0x1000u64.to_le_bytes()); // SizeOfHeapCommit
-        // LoaderFlags = 0
-        // NumberOfRvaAndSizes = 16
-        pe[opt_base + 108..opt_base + 112].copy_from_slice(&16u32.to_le_bytes());
+    // DLL characteristics
+    let dll_chars = dll_characteristics::DYNAMIC_BASE
+        | dll_characteristics::NX_COMPAT
+        | dll_characteristics::NO_SEH
+        | dll_characteristics::TERMINAL_SERVER_AWARE;
 
-        // Data Directories start at opt_base + 112
-        // We only need CLI header (index 14)
-        let cli_dir_offset = opt_base + 112 + 14 * 8;
-        pe[cli_dir_offset..cli_dir_offset + 4].copy_from_slice(&TEXT_RVA.to_le_bytes()); // CLI RVA
-        pe[cli_dir_offset + 4..cli_dir_offset + 8].copy_from_slice(&COR20_SIZE.to_le_bytes()); // CLI Size
+    // Create 16 data directories (all zeroed initially)
+    let mut data_directories = vec![DataDirectory::default(); 16];
+    // Set CLR Runtime directory (index 14)
+    data_directories[DataDirectoryType::ClrRuntime.as_index()] = DataDirectory {
+        virtual_address: cli_rva,
+        size: cli_size,
+    };
+
+    // Create optional header
+    let optional_header = if is_64bit {
+        OptionalHeader::Pe32Plus(OptionalHeader64 {
+            magic: 0x20B,
+            major_linker_version: 14,
+            minor_linker_version: 0,
+            size_of_code: 0, // Will be updated
+            size_of_initialized_data: 0,
+            size_of_uninitialized_data: 0,
+            address_of_entry_point: 0, // Pure IL
+            base_of_code: SECTION_ALIGNMENT,
+            image_base: 0x180000000,
+            section_alignment: SECTION_ALIGNMENT,
+            file_alignment: FILE_ALIGNMENT,
+            major_operating_system_version: 6,
+            minor_operating_system_version: 0,
+            major_image_version: 0,
+            minor_image_version: 0,
+            major_subsystem_version: 6,
+            minor_subsystem_version: 0,
+            win32_version_value: 0,
+            size_of_image: 0,   // Will be updated
+            size_of_headers: 0, // Will be updated
+            check_sum: 0,
+            subsystem: 3, // WINDOWS_CUI
+            dll_characteristics: dll_chars,
+            size_of_stack_reserve: 0x100000,
+            size_of_stack_commit: 0x1000,
+            size_of_heap_reserve: 0x100000,
+            size_of_heap_commit: 0x1000,
+            loader_flags: 0,
+            number_of_rva_and_sizes: 16,
+            data_directories,
+        })
     } else {
-        // PE32 Magic
-        pe[opt_base..opt_base + 2].copy_from_slice(&0x10Bu16.to_le_bytes());
-        pe[opt_base + 2] = 14;
-        pe[opt_base + 3] = 0;
-        pe[opt_base + 4..opt_base + 8].copy_from_slice(&text_raw_size_aligned.to_le_bytes());
-        pe[opt_base + 20..opt_base + 24].copy_from_slice(&TEXT_RVA.to_le_bytes());
-        // BaseOfData (PE32 only)
-        pe[opt_base + 24..opt_base + 28].copy_from_slice(&TEXT_RVA.to_le_bytes());
-        // ImageBase (4 bytes for PE32) = 0x10000000
-        pe[opt_base + 28..opt_base + 32].copy_from_slice(&0x10000000u32.to_le_bytes());
-        pe[opt_base + 32..opt_base + 36].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
-        pe[opt_base + 36..opt_base + 40].copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
-        pe[opt_base + 40..opt_base + 42].copy_from_slice(&6u16.to_le_bytes());
-        pe[opt_base + 42..opt_base + 44].copy_from_slice(&0u16.to_le_bytes());
-        pe[opt_base + 48..opt_base + 50].copy_from_slice(&6u16.to_le_bytes());
-        pe[opt_base + 50..opt_base + 52].copy_from_slice(&0u16.to_le_bytes());
-        pe[opt_base + 56..opt_base + 60].copy_from_slice(&size_of_image.to_le_bytes());
-        pe[opt_base + 60..opt_base + 64].copy_from_slice(&SIZE_OF_HEADERS.to_le_bytes());
-        pe[opt_base + 68..opt_base + 70].copy_from_slice(&3u16.to_le_bytes());
-        let dll_chars: u16 = 0x0040 | 0x0100 | 0x0400 | 0x8000;
-        pe[opt_base + 70..opt_base + 72].copy_from_slice(&dll_chars.to_le_bytes());
-        // Stack/Heap sizes (4 bytes each for PE32)
-        pe[opt_base + 72..opt_base + 76].copy_from_slice(&0x100000u32.to_le_bytes());
-        pe[opt_base + 76..opt_base + 80].copy_from_slice(&0x1000u32.to_le_bytes());
-        pe[opt_base + 80..opt_base + 84].copy_from_slice(&0x100000u32.to_le_bytes());
-        pe[opt_base + 84..opt_base + 88].copy_from_slice(&0x1000u32.to_le_bytes());
-        pe[opt_base + 92..opt_base + 96].copy_from_slice(&16u32.to_le_bytes());
+        OptionalHeader::Pe32(OptionalHeader32 {
+            magic: 0x10B,
+            major_linker_version: 14,
+            minor_linker_version: 0,
+            size_of_code: 0,
+            size_of_initialized_data: 0,
+            size_of_uninitialized_data: 0,
+            address_of_entry_point: 0,
+            base_of_code: SECTION_ALIGNMENT,
+            base_of_data: SECTION_ALIGNMENT,
+            image_base: 0x10000000,
+            section_alignment: SECTION_ALIGNMENT,
+            file_alignment: FILE_ALIGNMENT,
+            major_operating_system_version: 6,
+            minor_operating_system_version: 0,
+            major_image_version: 0,
+            minor_image_version: 0,
+            major_subsystem_version: 6,
+            minor_subsystem_version: 0,
+            win32_version_value: 0,
+            size_of_image: 0,
+            size_of_headers: 0,
+            check_sum: 0,
+            subsystem: 3,
+            dll_characteristics: dll_chars,
+            size_of_stack_reserve: 0x100000,
+            size_of_stack_commit: 0x1000,
+            size_of_heap_reserve: 0x100000,
+            size_of_heap_commit: 0x1000,
+            loader_flags: 0,
+            number_of_rva_and_sizes: 16,
+            data_directories,
+        })
+    };
 
-        let cli_dir_offset = opt_base + 96 + 14 * 8;
-        pe[cli_dir_offset..cli_dir_offset + 4].copy_from_slice(&TEXT_RVA.to_le_bytes());
-        pe[cli_dir_offset + 4..cli_dir_offset + 8].copy_from_slice(&COR20_SIZE.to_le_bytes());
+    // Create .text section
+    let mut text_section = Section::new(
+        ".text",
+        sec_chars::CODE | sec_chars::EXECUTE | sec_chars::READ,
+    );
+    text_section.set_data(text_section_data.to_vec());
+
+    // Assemble PE
+    PE {
+        dos_header,
+        dos_stub: vec![0u8; 64], // Minimal stub
+        coff_header,
+        optional_header,
+        sections: vec![text_section],
     }
+}
 
-    // Section Header for .text
-    let section_header_offset = opt_base + size_of_optional_header as usize;
-    // Name: ".text\0\0\0"
-    pe[section_header_offset..section_header_offset + 5].copy_from_slice(b".text");
-    // VirtualSize
-    pe[section_header_offset + 8..section_header_offset + 12]
-        .copy_from_slice(&text_virtual_size.to_le_bytes());
-    // VirtualAddress
-    pe[section_header_offset + 12..section_header_offset + 16]
-        .copy_from_slice(&TEXT_RVA.to_le_bytes());
-    // SizeOfRawData
-    pe[section_header_offset + 16..section_header_offset + 20]
-        .copy_from_slice(&text_raw_size_aligned.to_le_bytes());
-    // PointerToRawData
-    pe[section_header_offset + 20..section_header_offset + 24]
-        .copy_from_slice(&SIZE_OF_HEADERS.to_le_bytes());
-    // Characteristics: CNT_CODE | MEM_EXECUTE | MEM_READ
-    let section_chars: u32 = 0x00000020 | 0x20000000 | 0x40000000;
-    pe[section_header_offset + 36..section_header_offset + 40]
-        .copy_from_slice(&section_chars.to_le_bytes());
+/// Build COR20 header + metadata as a contiguous byte buffer.
+fn build_cor20_and_metadata(
+    metadata_rva: u32,
+    metadata_size: u32,
+    cor_flags: u32,
+    entry_point_token: u32,
+    metadata: &[u8],
+) -> Vec<u8> {
+    const COR20_SIZE: usize = 72;
 
-    // COR20 Header at file offset 0x200 (SIZE_OF_HEADERS)
-    let cor20_offset = SIZE_OF_HEADERS as usize;
+    let mut data = vec![0u8; COR20_SIZE + metadata.len()];
+
+    // COR20 Header (IMAGE_COR20_HEADER)
     // cb = 72
-    pe[cor20_offset..cor20_offset + 4].copy_from_slice(&COR20_SIZE.to_le_bytes());
+    data[0..4].copy_from_slice(&(COR20_SIZE as u32).to_le_bytes());
     // MajorRuntimeVersion = 2
-    pe[cor20_offset + 4..cor20_offset + 6].copy_from_slice(&2u16.to_le_bytes());
+    data[4..6].copy_from_slice(&2u16.to_le_bytes());
     // MinorRuntimeVersion = 5
-    pe[cor20_offset + 6..cor20_offset + 8].copy_from_slice(&5u16.to_le_bytes());
+    data[6..8].copy_from_slice(&5u16.to_le_bytes());
     // MetaData RVA
-    pe[cor20_offset + 8..cor20_offset + 12].copy_from_slice(&METADATA_RVA.to_le_bytes());
+    data[8..12].copy_from_slice(&metadata_rva.to_le_bytes());
     // MetaData Size
-    pe[cor20_offset + 12..cor20_offset + 16].copy_from_slice(&metadata_size.to_le_bytes());
-    // Flags (extracted from metadata analysis)
-    pe[cor20_offset + 16..cor20_offset + 20].copy_from_slice(&cor_flags.to_le_bytes());
-    // EntryPointToken (MethodDef token for Main if found)
-    pe[cor20_offset + 20..cor20_offset + 24].copy_from_slice(&entry_point_token.to_le_bytes());
-    // Rest of COR20 header fields are 0 (no resources, strong name, etc.)
+    data[12..16].copy_from_slice(&metadata_size.to_le_bytes());
+    // Flags
+    data[16..20].copy_from_slice(&cor_flags.to_le_bytes());
+    // EntryPointToken
+    data[20..24].copy_from_slice(&entry_point_token.to_le_bytes());
+    // Rest of COR20 header fields are 0
 
     // Copy metadata after COR20 header
-    let metadata_offset = cor20_offset + COR20_SIZE as usize;
-    pe[metadata_offset..metadata_offset + metadata.len()].copy_from_slice(metadata);
+    data[COR20_SIZE..].copy_from_slice(metadata);
 
-    pe
+    data
 }
 
 use crate::process::ILMethodBody;
@@ -1068,151 +971,89 @@ pub fn build_pe_from_metadata_with_il(
 
     let (entry_point_token, cor_flags) = extract_metadata_info(metadata);
 
-    const FILE_ALIGNMENT: u32 = 0x200;
-    const SECTION_ALIGNMENT: u32 = 0x1000;
-    const SIZE_OF_HEADERS: u32 = 0x200;
     const TEXT_RVA: u32 = 0x1000;
     const COR20_SIZE: u32 = 72;
-    const METADATA_RVA: u32 = TEXT_RVA + COR20_SIZE; // 0x1048
+    const METADATA_RVA: u32 = TEXT_RVA + COR20_SIZE;
 
     let metadata_size = metadata.len() as u32;
 
-    // Find the range of IL RVAs to determine PE layout
-    let _min_il_rva = il_bodies.iter().map(|b| b.rva).min().unwrap_or(0);
+    // Find the range of IL RVAs to determine section size
     let max_il_end = il_bodies
         .iter()
         .map(|b| b.rva + b.data.len() as u32)
         .max()
         .unwrap_or(0);
 
-    // Calculate .text section layout:
-    // - COR20 header at TEXT_RVA (0x1000)
-    // - Metadata immediately after (0x1048)
-    // - IL bodies at their original RVAs (may be after metadata or scattered)
-
     // The .text section needs to span from TEXT_RVA to max(metadata_end, max_il_end)
     let metadata_end_rva = METADATA_RVA + metadata_size;
     let text_virtual_end = metadata_end_rva.max(max_il_end);
-    let text_virtual_size = text_virtual_end - TEXT_RVA;
-    let text_raw_size_aligned = (text_virtual_size + FILE_ALIGNMENT - 1) & !(FILE_ALIGNMENT - 1);
-    let size_of_image =
-        TEXT_RVA + ((text_virtual_size + SECTION_ALIGNMENT - 1) & !(SECTION_ALIGNMENT - 1));
+    let section_size = (text_virtual_end - TEXT_RVA) as usize;
 
-    let total_file_size = SIZE_OF_HEADERS as usize + text_raw_size_aligned as usize;
-    let mut pe = vec![0u8; total_file_size];
+    // Build section data with space for COR20 + metadata + IL bodies
+    let section_data = build_cor20_metadata_and_il(
+        METADATA_RVA,
+        metadata_size,
+        cor_flags,
+        entry_point_token,
+        metadata,
+        section_size,
+        TEXT_RVA,
+        il_bodies,
+    );
 
-    // DOS Header (64 bytes)
-    pe[0] = 0x4D; // 'M'
-    pe[1] = 0x5A; // 'Z'
-    pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+    // Build PE using portex
+    let pe = build_dotnet_pe(
+        is_64bit,
+        entry_point_token == 0,
+        &section_data,
+        TEXT_RVA,
+        COR20_SIZE,
+    );
+    pe.build()
+}
 
-    // PE Signature at 0x80
-    pe[0x80] = 0x50; // 'P'
-    pe[0x81] = 0x45; // 'E'
+/// Build COR20 header + metadata + IL bodies as a contiguous byte buffer.
+#[allow(clippy::too_many_arguments)]
+fn build_cor20_metadata_and_il(
+    metadata_rva: u32,
+    metadata_size: u32,
+    cor_flags: u32,
+    entry_point_token: u32,
+    metadata: &[u8],
+    section_size: usize,
+    text_rva: u32,
+    il_bodies: &[ILMethodBody],
+) -> Vec<u8> {
+    const COR20_SIZE: usize = 72;
 
-    // COFF Header (20 bytes at 0x84)
-    let machine = if is_64bit { 0x8664u16 } else { 0x014Cu16 };
-    pe[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
-    pe[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // NumberOfSections = 1
-    let size_of_optional_header: u16 = if is_64bit { 240 } else { 224 };
-    pe[0x94..0x96].copy_from_slice(&size_of_optional_header.to_le_bytes());
-    // Characteristics: EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
-    // Add DLL flag only if no entry point (it's a library)
-    let mut characteristics: u16 = 0x0002 | 0x0020; // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
-    if entry_point_token == 0 {
-        characteristics |= 0x2000; // IMAGE_FILE_DLL
-    }
-    pe[0x96..0x98].copy_from_slice(&characteristics.to_le_bytes());
+    let mut data = vec![0u8; section_size];
 
-    // Optional Header starts at 0x98
-    let opt_base = 0x98usize;
+    // COR20 Header at offset 0 (RVA = text_rva)
+    data[0..4].copy_from_slice(&(COR20_SIZE as u32).to_le_bytes());
+    data[4..6].copy_from_slice(&2u16.to_le_bytes()); // MajorRuntimeVersion
+    data[6..8].copy_from_slice(&5u16.to_le_bytes()); // MinorRuntimeVersion
+    data[8..12].copy_from_slice(&metadata_rva.to_le_bytes());
+    data[12..16].copy_from_slice(&metadata_size.to_le_bytes());
+    data[16..20].copy_from_slice(&cor_flags.to_le_bytes());
+    data[20..24].copy_from_slice(&entry_point_token.to_le_bytes());
 
-    if is_64bit {
-        // PE32+ Optional Header
-        pe[opt_base..opt_base + 2].copy_from_slice(&0x20Bu16.to_le_bytes()); // Magic
-        pe[opt_base + 2] = 14; // MajorLinkerVersion
-        pe[opt_base + 16..opt_base + 20].copy_from_slice(&text_virtual_size.to_le_bytes()); // SizeOfCode
-        pe[opt_base + 24..opt_base + 28].copy_from_slice(&TEXT_RVA.to_le_bytes()); // BaseOfCode
-        pe[opt_base + 32..opt_base + 36].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
-        pe[opt_base + 36..opt_base + 40].copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
-        pe[opt_base + 40..opt_base + 42].copy_from_slice(&6u16.to_le_bytes()); // MajorOSVersion
-        pe[opt_base + 48..opt_base + 50].copy_from_slice(&6u16.to_le_bytes()); // MajorSubsystemVersion
-        pe[opt_base + 56..opt_base + 60].copy_from_slice(&size_of_image.to_le_bytes());
-        pe[opt_base + 60..opt_base + 64].copy_from_slice(&SIZE_OF_HEADERS.to_le_bytes());
-        pe[opt_base + 68..opt_base + 70].copy_from_slice(&3u16.to_le_bytes()); // Subsystem (CONSOLE)
-        pe[opt_base + 70..opt_base + 72].copy_from_slice(&0x8160u16.to_le_bytes()); // DllCharacteristics
-        pe[opt_base + 108..opt_base + 112].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
-        // CLR Runtime Header at data dir index 14
-        let clr_dir_offset = opt_base + 112 + 14 * 8;
-        pe[clr_dir_offset..clr_dir_offset + 4].copy_from_slice(&TEXT_RVA.to_le_bytes());
-        pe[clr_dir_offset + 4..clr_dir_offset + 8].copy_from_slice(&COR20_SIZE.to_le_bytes());
-    } else {
-        // PE32 Optional Header
-        pe[opt_base..opt_base + 2].copy_from_slice(&0x10Bu16.to_le_bytes()); // Magic
-        pe[opt_base + 2] = 14; // MajorLinkerVersion
-        pe[opt_base + 16..opt_base + 20].copy_from_slice(&text_virtual_size.to_le_bytes()); // SizeOfCode
-        pe[opt_base + 24..opt_base + 28].copy_from_slice(&TEXT_RVA.to_le_bytes()); // BaseOfCode
-        pe[opt_base + 28..opt_base + 32].copy_from_slice(&TEXT_RVA.to_le_bytes()); // BaseOfData
-        pe[opt_base + 32..opt_base + 36].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
-        pe[opt_base + 36..opt_base + 40].copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
-        pe[opt_base + 40..opt_base + 42].copy_from_slice(&6u16.to_le_bytes()); // MajorOSVersion
-        pe[opt_base + 48..opt_base + 50].copy_from_slice(&6u16.to_le_bytes()); // MajorSubsystemVersion
-        pe[opt_base + 56..opt_base + 60].copy_from_slice(&size_of_image.to_le_bytes());
-        pe[opt_base + 60..opt_base + 64].copy_from_slice(&SIZE_OF_HEADERS.to_le_bytes());
-        pe[opt_base + 68..opt_base + 70].copy_from_slice(&3u16.to_le_bytes()); // Subsystem (CONSOLE)
-        pe[opt_base + 70..opt_base + 72].copy_from_slice(&0x8140u16.to_le_bytes()); // DllCharacteristics
-        pe[opt_base + 92..opt_base + 96].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
-        let clr_dir_offset = opt_base + 96 + 14 * 8;
-        pe[clr_dir_offset..clr_dir_offset + 4].copy_from_slice(&TEXT_RVA.to_le_bytes());
-        pe[clr_dir_offset + 4..clr_dir_offset + 8].copy_from_slice(&COR20_SIZE.to_le_bytes());
+    // Metadata after COR20 header
+    let metadata_offset = COR20_SIZE;
+    if metadata_offset + metadata.len() <= data.len() {
+        data[metadata_offset..metadata_offset + metadata.len()].copy_from_slice(metadata);
     }
 
-    // Section Header (.text) at 0x188 (PE32+) or 0x178 (PE32)
-    let section_header_offset = if is_64bit { 0x188usize } else { 0x178usize };
-    pe[section_header_offset..section_header_offset + 8].copy_from_slice(b".text\0\0\0");
-    pe[section_header_offset + 8..section_header_offset + 12]
-        .copy_from_slice(&text_virtual_size.to_le_bytes());
-    pe[section_header_offset + 12..section_header_offset + 16]
-        .copy_from_slice(&TEXT_RVA.to_le_bytes());
-    pe[section_header_offset + 16..section_header_offset + 20]
-        .copy_from_slice(&text_raw_size_aligned.to_le_bytes());
-    pe[section_header_offset + 20..section_header_offset + 24]
-        .copy_from_slice(&SIZE_OF_HEADERS.to_le_bytes());
-    let section_characteristics: u32 = 0x60000020; // CODE | EXECUTE | READ
-    pe[section_header_offset + 36..section_header_offset + 40]
-        .copy_from_slice(&section_characteristics.to_le_bytes());
-
-    // .text section content starts at file offset SIZE_OF_HEADERS (0x200)
-    // RVA 0x1000 maps to file offset 0x200
-    // RVA X maps to file offset 0x200 + (X - 0x1000)
-    let rva_to_file_offset =
-        |rva: u32| -> usize { SIZE_OF_HEADERS as usize + (rva - TEXT_RVA) as usize };
-
-    // COR20 Header at RVA 0x1000 (file offset 0x200)
-    let cor20_offset = rva_to_file_offset(TEXT_RVA);
-    pe[cor20_offset..cor20_offset + 4].copy_from_slice(&COR20_SIZE.to_le_bytes());
-    pe[cor20_offset + 4..cor20_offset + 6].copy_from_slice(&2u16.to_le_bytes());
-    pe[cor20_offset + 6..cor20_offset + 8].copy_from_slice(&5u16.to_le_bytes());
-    pe[cor20_offset + 8..cor20_offset + 12].copy_from_slice(&METADATA_RVA.to_le_bytes());
-    pe[cor20_offset + 12..cor20_offset + 16].copy_from_slice(&metadata_size.to_le_bytes());
-    pe[cor20_offset + 16..cor20_offset + 20].copy_from_slice(&cor_flags.to_le_bytes());
-    pe[cor20_offset + 20..cor20_offset + 24].copy_from_slice(&entry_point_token.to_le_bytes());
-
-    // Copy metadata at RVA 0x1048
-    let metadata_offset = rva_to_file_offset(METADATA_RVA);
-    pe[metadata_offset..metadata_offset + metadata.len()].copy_from_slice(metadata);
-
-    // Copy IL bodies at their original RVAs
+    // Copy IL bodies at their original RVAs (relative to section start)
     for body in il_bodies {
-        if body.rva >= TEXT_RVA {
-            let file_offset = rva_to_file_offset(body.rva);
-            if file_offset + body.data.len() <= pe.len() {
-                pe[file_offset..file_offset + body.data.len()].copy_from_slice(&body.data);
+        if body.rva >= text_rva {
+            let offset = (body.rva - text_rva) as usize;
+            if offset + body.data.len() <= data.len() {
+                data[offset..offset + body.data.len()].copy_from_slice(&body.data);
             }
         }
     }
 
-    pe
+    data
 }
 
 // =============================================================================
@@ -1409,178 +1250,166 @@ pub fn is_pe_header_corrupted(buffer: &[u8]) -> bool {
 
 /// Build a complete PE file with reconstructed headers
 pub fn build_pe_with_reconstructed_headers(memory_image: &[u8], pe_info: &PeInfo) -> Vec<u8> {
-    // Calculate file size
-    let mut file_size = pe_info.size_of_headers as usize;
-    for section in &pe_info.sections {
-        let section_end = section.pointer_to_raw_data as usize + section.size_of_raw_data as usize;
-        if section_end > file_size {
-            file_size = section_end;
-        }
-    }
+    const FILE_ALIGNMENT: u32 = 0x200;
+    const SECTION_ALIGNMENT: u32 = 0x1000;
 
-    let mut file_image = vec![0u8; file_size];
+    // Create DOS header
+    let dos_header = DosHeader {
+        e_magic: 0x5A4D,
+        e_cblp: 0x90,
+        e_cp: 0x03,
+        e_crlc: 0,
+        e_cparhdr: 0x04,
+        e_minalloc: 0,
+        e_maxalloc: 0xFFFF,
+        e_ss: 0,
+        e_sp: 0xB8,
+        e_csum: 0,
+        e_ip: 0,
+        e_cs: 0,
+        e_lfarlc: 0x40,
+        e_ovno: 0,
+        e_res: [0; 4],
+        e_oemid: 0,
+        e_oeminfo: 0,
+        e_res2: [0; 10],
+        e_lfanew: 0x80,
+    };
 
-    // Build DOS header
-    let dos_header: [u8; 64] = [
-        0x4D, 0x5A, // MZ signature
-        0x90, 0x00, // Bytes on last page
-        0x03, 0x00, // Pages in file
-        0x00, 0x00, // Relocations
-        0x04, 0x00, // Size of header in paragraphs
-        0x00, 0x00, // Minimum extra paragraphs
-        0xFF, 0xFF, // Maximum extra paragraphs
-        0x00, 0x00, // Initial SS
-        0xB8, 0x00, // Initial SP
-        0x00, 0x00, // Checksum
-        0x00, 0x00, // Initial IP
-        0x00, 0x00, // Initial CS
-        0x40, 0x00, // Offset to relocation table
-        0x00, 0x00, // Overlay number
-        0x00, 0x00, 0x00, 0x00, // Reserved
-        0x00, 0x00, 0x00, 0x00, // Reserved
-        0x00, 0x00, // OEM identifier
-        0x00, 0x00, // OEM info
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Reserved
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Reserved
-        0x00, 0x00, 0x00, 0x00, // Reserved
-        0x80, 0x00, 0x00, 0x00, // e_lfanew (offset to PE header = 0x80)
-    ];
-    file_image[..64].copy_from_slice(&dos_header);
-
-    // DOS stub (minimal)
-    let dos_stub: [u8; 64] = [
+    // DOS stub (minimal "This program cannot be run in DOS mode")
+    let dos_stub: Vec<u8> = vec![
         0x0E, 0x1F, 0xBA, 0x0E, 0x00, 0xB4, 0x09, 0xCD, 0x21, 0xB8, 0x01, 0x4C, 0xCD, 0x21, 0x54,
         0x68, 0x69, 0x73, 0x20, 0x70, 0x72, 0x6F, 0x67, 0x72, 0x61, 0x6D, 0x20, 0x63, 0x61, 0x6E,
         0x6E, 0x6F, 0x74, 0x20, 0x62, 0x65, 0x20, 0x72, 0x75, 0x6E, 0x20, 0x69, 0x6E, 0x20, 0x44,
         0x4F, 0x53, 0x20, 0x6D, 0x6F, 0x64, 0x65, 0x2E, 0x0D, 0x0D, 0x0A, 0x24, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00,
     ];
-    file_image[64..128].copy_from_slice(&dos_stub);
 
-    // PE signature at 0x80
-    file_image[0x80..0x84].copy_from_slice(&[0x50, 0x45, 0x00, 0x00]); // "PE\0\0"
+    // COFF characteristics: EXECUTABLE_IMAGE | DLL
+    let characteristics = coff_chars::EXECUTABLE_IMAGE | coff_chars::DLL;
 
-    // COFF header (20 bytes) at 0x84
-    let coff_offset = 0x84;
-    // Machine (from pe_info, detected from target process)
-    file_image[coff_offset..coff_offset + 2].copy_from_slice(&pe_info.machine_type.to_le_bytes());
-    // NumberOfSections
-    file_image[coff_offset + 2..coff_offset + 4]
-        .copy_from_slice(&pe_info.number_of_sections.to_le_bytes());
-    // TimeDateStamp (0)
-    file_image[coff_offset + 4..coff_offset + 8].copy_from_slice(&0u32.to_le_bytes());
-    // PointerToSymbolTable (0)
-    file_image[coff_offset + 8..coff_offset + 12].copy_from_slice(&0u32.to_le_bytes());
-    // NumberOfSymbols (0)
-    file_image[coff_offset + 12..coff_offset + 16].copy_from_slice(&0u32.to_le_bytes());
-    // SizeOfOptionalHeader
-    file_image[coff_offset + 16..coff_offset + 18]
-        .copy_from_slice(&pe_info.size_of_optional_header.to_le_bytes());
-    // Characteristics: EXECUTABLE_IMAGE | DLL
-    let characteristics: u16 = 0x2000 | 0x0002; // DLL | EXECUTABLE_IMAGE
-    file_image[coff_offset + 18..coff_offset + 20].copy_from_slice(&characteristics.to_le_bytes());
+    let coff_header = CoffHeader {
+        machine: pe_info.machine_type,
+        number_of_sections: pe_info.number_of_sections,
+        time_date_stamp: 0,
+        pointer_to_symbol_table: 0,
+        number_of_symbols: 0,
+        size_of_optional_header: 0, // Will be set by portex
+        characteristics,
+    };
 
-    // Optional header at 0x98
-    let opt_offset = 0x98;
-    if pe_info.is_pe32_plus {
-        // PE32+ magic
-        file_image[opt_offset..opt_offset + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
-        // Linker version
-        file_image[opt_offset + 2] = 14;
-        file_image[opt_offset + 3] = 0;
-        // SizeOfCode, SizeOfInitializedData, SizeOfUninitializedData (estimate)
-        // AddressOfEntryPoint at offset 16
-        // BaseOfCode at offset 20
-        // ImageBase at offset 24 (8 bytes for PE32+)
-        file_image[opt_offset + 24..opt_offset + 32].copy_from_slice(&0x180000000u64.to_le_bytes());
-        // SectionAlignment at offset 32
-        file_image[opt_offset + 32..opt_offset + 36].copy_from_slice(&0x1000u32.to_le_bytes());
-        // FileAlignment at offset 36
-        file_image[opt_offset + 36..opt_offset + 40].copy_from_slice(&0x200u32.to_le_bytes());
-        // OS version at offset 40
-        file_image[opt_offset + 40..opt_offset + 42].copy_from_slice(&6u16.to_le_bytes());
-        // SizeOfImage at offset 56
-        file_image[opt_offset + 56..opt_offset + 60]
-            .copy_from_slice(&pe_info.size_of_image.to_le_bytes());
-        // SizeOfHeaders at offset 60
-        file_image[opt_offset + 60..opt_offset + 64]
-            .copy_from_slice(&pe_info.size_of_headers.to_le_bytes());
-        // Subsystem at offset 68: IMAGE_SUBSYSTEM_WINDOWS_CUI = 3
-        file_image[opt_offset + 68..opt_offset + 70].copy_from_slice(&3u16.to_le_bytes());
-        // DllCharacteristics at offset 70: DYNAMIC_BASE | NX_COMPAT | NO_SEH
-        file_image[opt_offset + 70..opt_offset + 72].copy_from_slice(&0x8160u16.to_le_bytes());
-        // NumberOfRvaAndSizes at offset 108
-        file_image[opt_offset + 108..opt_offset + 112].copy_from_slice(&16u32.to_le_bytes());
+    // DLL characteristics
+    let dll_chars = dll_characteristics::DYNAMIC_BASE
+        | dll_characteristics::NX_COMPAT
+        | dll_characteristics::NO_SEH
+        | dll_characteristics::TERMINAL_SERVER_AWARE;
+
+    // Create data directories (16 entries, all zeroed for reconstruction)
+    let data_directories = vec![DataDirectory::default(); 16];
+
+    // Create optional header
+    let optional_header = if pe_info.is_pe32_plus {
+        OptionalHeader::Pe32Plus(OptionalHeader64 {
+            magic: 0x20B,
+            major_linker_version: 14,
+            minor_linker_version: 0,
+            size_of_code: 0,
+            size_of_initialized_data: 0,
+            size_of_uninitialized_data: 0,
+            address_of_entry_point: 0,
+            base_of_code: SECTION_ALIGNMENT,
+            image_base: 0x180000000,
+            section_alignment: SECTION_ALIGNMENT,
+            file_alignment: FILE_ALIGNMENT,
+            major_operating_system_version: 6,
+            minor_operating_system_version: 0,
+            major_image_version: 0,
+            minor_image_version: 0,
+            major_subsystem_version: 6,
+            minor_subsystem_version: 0,
+            win32_version_value: 0,
+            size_of_image: pe_info.size_of_image,
+            size_of_headers: 0, // Will be updated
+            check_sum: 0,
+            subsystem: 3, // WINDOWS_CUI
+            dll_characteristics: dll_chars,
+            size_of_stack_reserve: 0x100000,
+            size_of_stack_commit: 0x1000,
+            size_of_heap_reserve: 0x100000,
+            size_of_heap_commit: 0x1000,
+            loader_flags: 0,
+            number_of_rva_and_sizes: 16,
+            data_directories,
+        })
     } else {
-        // PE32 magic
-        file_image[opt_offset..opt_offset + 2].copy_from_slice(&0x10Bu16.to_le_bytes());
-        // Similar fields but with 32-bit ImageBase at offset 28
-        file_image[opt_offset + 28..opt_offset + 32].copy_from_slice(&0x10000000u32.to_le_bytes());
-        // SectionAlignment at offset 32
-        file_image[opt_offset + 32..opt_offset + 36].copy_from_slice(&0x1000u32.to_le_bytes());
-        // FileAlignment at offset 36
-        file_image[opt_offset + 36..opt_offset + 40].copy_from_slice(&0x200u32.to_le_bytes());
-        // SizeOfImage at offset 56
-        file_image[opt_offset + 56..opt_offset + 60]
-            .copy_from_slice(&pe_info.size_of_image.to_le_bytes());
-        // SizeOfHeaders at offset 60
-        file_image[opt_offset + 60..opt_offset + 64]
-            .copy_from_slice(&pe_info.size_of_headers.to_le_bytes());
-        // NumberOfRvaAndSizes at offset 92
-        file_image[opt_offset + 92..opt_offset + 96].copy_from_slice(&16u32.to_le_bytes());
-    }
+        OptionalHeader::Pe32(OptionalHeader32 {
+            magic: 0x10B,
+            major_linker_version: 14,
+            minor_linker_version: 0,
+            size_of_code: 0,
+            size_of_initialized_data: 0,
+            size_of_uninitialized_data: 0,
+            address_of_entry_point: 0,
+            base_of_code: SECTION_ALIGNMENT,
+            base_of_data: SECTION_ALIGNMENT,
+            image_base: 0x10000000,
+            section_alignment: SECTION_ALIGNMENT,
+            file_alignment: FILE_ALIGNMENT,
+            major_operating_system_version: 6,
+            minor_operating_system_version: 0,
+            major_image_version: 0,
+            minor_image_version: 0,
+            major_subsystem_version: 6,
+            minor_subsystem_version: 0,
+            win32_version_value: 0,
+            size_of_image: pe_info.size_of_image,
+            size_of_headers: 0,
+            check_sum: 0,
+            subsystem: 3,
+            dll_characteristics: dll_chars,
+            size_of_stack_reserve: 0x100000,
+            size_of_stack_commit: 0x1000,
+            size_of_heap_reserve: 0x100000,
+            size_of_heap_commit: 0x1000,
+            loader_flags: 0,
+            number_of_rva_and_sizes: 16,
+            data_directories,
+        })
+    };
 
-    // Section headers start after optional header
-    let section_table_offset = opt_offset + pe_info.size_of_optional_header as usize;
-    for (i, section) in pe_info.sections.iter().enumerate() {
-        let section_offset = section_table_offset + i * 40;
+    // Build sections from pe_info
+    let section_names = [".text", ".rdata", ".data", ".rsrc", ".sect"];
+    let mut sections = Vec::new();
+    for (i, section_info) in pe_info.sections.iter().enumerate() {
+        let name = section_names.get(i).unwrap_or(&".sect");
+        let characteristics = sec_chars::CODE | sec_chars::EXECUTE | sec_chars::READ;
 
-        // Section name (8 bytes) - generate .text, .data, .rsrc, etc.
-        let name = match i {
-            0 => b".text\0\0\0",
-            1 => b".rdata\0\0",
-            2 => b".data\0\0\0",
-            3 => b".rsrc\0\0\0",
-            _ => b".sect\0\0\0",
-        };
-        file_image[section_offset..section_offset + 8].copy_from_slice(name);
+        let mut section = Section::new(name, characteristics);
 
-        // VirtualSize
-        file_image[section_offset + 8..section_offset + 12]
-            .copy_from_slice(&section.virtual_size.to_le_bytes());
-        // VirtualAddress
-        file_image[section_offset + 12..section_offset + 16]
-            .copy_from_slice(&section.virtual_address.to_le_bytes());
-        // SizeOfRawData
-        file_image[section_offset + 16..section_offset + 20]
-            .copy_from_slice(&section.size_of_raw_data.to_le_bytes());
-        // PointerToRawData
-        file_image[section_offset + 20..section_offset + 24]
-            .copy_from_slice(&section.pointer_to_raw_data.to_le_bytes());
-        // PointerToRelocations, PointerToLinenumbers, NumberOfRelocations, NumberOfLinenumbers (0)
-        // Characteristics at offset 36
-        let characteristics: u32 = 0x60000020; // CODE | EXECUTE | READ
-        file_image[section_offset + 36..section_offset + 40]
-            .copy_from_slice(&characteristics.to_le_bytes());
-    }
+        // Extract section data from memory image
+        let src_offset = section_info.virtual_address as usize;
+        let copy_size = (section_info.size_of_raw_data as usize)
+            .min(section_info.virtual_size as usize)
+            .min(memory_image.len().saturating_sub(src_offset));
 
-    // Copy section data from memory image
-    for section in &pe_info.sections {
-        let src_offset = section.virtual_address as usize;
-        let dst_offset = section.pointer_to_raw_data as usize;
-
-        let copy_size = (section.size_of_raw_data as usize)
-            .min(section.virtual_size as usize)
-            .min(memory_image.len().saturating_sub(src_offset))
-            .min(file_image.len().saturating_sub(dst_offset));
-
-        if copy_size > 0 && src_offset < memory_image.len() && dst_offset < file_image.len() {
-            file_image[dst_offset..dst_offset + copy_size]
-                .copy_from_slice(&memory_image[src_offset..src_offset + copy_size]);
+        if copy_size > 0 && src_offset < memory_image.len() {
+            let data = memory_image[src_offset..src_offset + copy_size].to_vec();
+            section.set_data(data);
         }
+
+        sections.push(section);
     }
 
-    file_image
+    // Assemble PE
+    let pe = PE {
+        dos_header,
+        dos_stub,
+        coff_header,
+        optional_header,
+        sections,
+    };
+
+    pe.build()
 }
 
 // =============================================================================
