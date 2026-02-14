@@ -14,7 +14,7 @@ use portex::data_dir::{DataDirectory, DataDirectoryType};
 use portex::dos::DosHeader;
 use portex::optional::{OptionalHeader, OptionalHeader32, OptionalHeader64, dll_characteristics};
 use portex::section::{Section, characteristics as sec_chars};
-use portex::{PE, PEHeaders};
+use portex::{CliHeader, PE, PEHeaders};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQueryEx};
@@ -115,34 +115,17 @@ fn extract_metadata_bytes(pe_data: &[u8]) -> Option<&[u8]> {
         return None;
     }
 
-    // Convert CLI header RVA to file offset
+    // Convert CLI header RVA to file offset and parse it
     let cli_offset = headers.rva_to_offset(cli_dir.virtual_address)? as usize;
+    let cli_header = CliHeader::parse(&pe_data[cli_offset..]).ok()?;
 
-    // Read CLI header - metadata RVA is at offset 8, size at offset 12
-    if cli_offset + 16 > pe_data.len() {
-        return None;
-    }
-
-    let metadata_rva = u32::from_le_bytes([
-        pe_data[cli_offset + 8],
-        pe_data[cli_offset + 9],
-        pe_data[cli_offset + 10],
-        pe_data[cli_offset + 11],
-    ]);
-
-    let metadata_size = u32::from_le_bytes([
-        pe_data[cli_offset + 12],
-        pe_data[cli_offset + 13],
-        pe_data[cli_offset + 14],
-        pe_data[cli_offset + 15],
-    ]) as usize;
-
-    if metadata_rva == 0 || metadata_size == 0 {
+    if cli_header.metadata_rva == 0 || cli_header.metadata_size == 0 {
         return None;
     }
 
     // Convert metadata RVA to file offset
-    let metadata_offset = headers.rva_to_offset(metadata_rva)? as usize;
+    let metadata_offset = headers.rva_to_offset(cli_header.metadata_rva)? as usize;
+    let metadata_size = cli_header.metadata_size as usize;
 
     // Return slice of metadata bytes
     pe_data.get(metadata_offset..metadata_offset + metadata_size)
@@ -222,56 +205,50 @@ pub fn validate_cli_header_in_memory(
 
     let cli_rva = cli_dir.virtual_address;
 
-    // Read the CLI header from memory (still need direct read for content validation)
+    // Read the CLI header from memory
     let cli_header_addr = base_address + cli_rva as usize;
-    let mut cli_header = [0u8; 16];
+    let mut cli_header_bytes = [0u8; CliHeader::SIZE];
     let mut bytes_read = 0usize;
 
     let result = unsafe {
         ReadProcessMemory(
             process_handle,
             cli_header_addr as *const c_void,
-            cli_header.as_mut_ptr() as *mut c_void,
-            16,
+            cli_header_bytes.as_mut_ptr() as *mut c_void,
+            CliHeader::SIZE,
             Some(&mut bytes_read),
         )
     };
 
-    if result.is_err() || bytes_read < 16 {
+    if result.is_err() || bytes_read < CliHeader::SIZE {
         return false;
     }
+
+    // Parse and validate CLI header using portex
+    let cli_header = match CliHeader::parse(&cli_header_bytes) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
 
     // Validate CLI header structure:
     // - cb (size) should be 0x48 (72 bytes)
     // - MajorRuntimeVersion should be 2
     // - MinorRuntimeVersion should be 0 or 5
-    let cb = u32::from_le_bytes([cli_header[0], cli_header[1], cli_header[2], cli_header[3]]);
-    let major_version = u16::from_le_bytes([cli_header[4], cli_header[5]]);
-    let minor_version = u16::from_le_bytes([cli_header[6], cli_header[7]]);
-
-    // cb should be 0x48, major should be 2, minor should be 0 or 5
-    if cb != 0x48 {
+    if cli_header.cb != 0x48 {
         return false;
     }
-    if major_version != 2 {
+    if cli_header.major_runtime_version != 2 {
         return false;
     }
-    if minor_version != 0 && minor_version != 5 {
+    if cli_header.minor_runtime_version != 0 && cli_header.minor_runtime_version != 5 {
         return false;
     }
-
-    // Also validate metadata RVA is reasonable
-    let meta_rva =
-        u32::from_le_bytes([cli_header[8], cli_header[9], cli_header[10], cli_header[11]]);
-    let meta_size = u32::from_le_bytes([
-        cli_header[12],
-        cli_header[13],
-        cli_header[14],
-        cli_header[15],
-    ]);
 
     // Metadata RVA should be less than image size
-    if meta_rva == 0 || meta_size == 0 || meta_rva > pe_info.size_of_image {
+    if cli_header.metadata_rva == 0
+        || cli_header.metadata_size == 0
+        || cli_header.metadata_rva > pe_info.size_of_image
+    {
         return false;
     }
 
@@ -293,17 +270,11 @@ pub fn extract_entry_point_from_pe(pe_data: &[u8]) -> u32 {
         None => return 0,
     };
 
-    if pe_data.len() < clr_file_offset + 24 {
-        return 0;
+    // Parse CLI header and extract entry point token
+    match CliHeader::parse(&pe_data[clr_file_offset..]) {
+        Ok(cli_header) => cli_header.entry_point_token_or_rva,
+        Err(_) => 0,
     }
-
-    // Entry point token is at offset 20 in COR20 header
-    u32::from_le_bytes([
-        pe_data[clr_file_offset + 20],
-        pe_data[clr_file_offset + 21],
-        pe_data[clr_file_offset + 22],
-        pe_data[clr_file_offset + 23],
-    ])
 }
 
 /// Extract entry point token and flags from raw metadata.
@@ -1687,43 +1658,6 @@ pub enum MetadataError {
     NameIndexOutOfBounds,
 }
 
-/// Extract the assembly name with detailed error info for debugging
-pub fn extract_assembly_name_from_metadata_debug(pe_data: &[u8]) -> Result<String, MetadataError> {
-    // Validate PE structure first for better error messages
-    if pe_data.len() < 64 {
-        return Err(MetadataError::TooSmall);
-    }
-    if pe_data[0] != b'M' || pe_data[1] != b'Z' {
-        return Err(MetadataError::NoDosSignature);
-    }
-
-    // Extract metadata bytes using portex
-    let metadata_bytes = extract_metadata_bytes(pe_data).ok_or(MetadataError::NoCliHeader)?;
-
-    // Check BSJB signature for specific error
-    if metadata_bytes.len() < 4 || &metadata_bytes[0..4] != b"BSJB" {
-        return Err(MetadataError::NoBsjbSignature);
-    }
-
-    // Parse with clrmeta
-    let metadata =
-        ClrMetadata::parse(metadata_bytes).map_err(|_| MetadataError::StreamParseError)?;
-
-    // Get assembly info
-    metadata
-        .assembly()
-        .map(|a| a.name)
-        .ok_or(MetadataError::NoAssemblyTable)
-}
-
-/// Extract the assembly name from .NET metadata in a PE file.
-/// Returns None if the file is not a .NET assembly or metadata is corrupted.
-pub fn extract_assembly_name_from_metadata(pe_data: &[u8]) -> Option<String> {
-    let metadata_bytes = extract_metadata_bytes(pe_data)?;
-    let metadata = ClrMetadata::parse(metadata_bytes).ok()?;
-    metadata.assembly().map(|a| a.name)
-}
-
 /// Extract full assembly metadata from PE data using clrmeta.
 /// Returns detailed information including version, culture, and public key token.
 pub fn extract_assembly_metadata(pe_data: &[u8]) -> Option<AssemblyMetadata> {
@@ -1748,6 +1682,35 @@ pub fn extract_assembly_metadata(pe_data: &[u8]) -> Option<AssemblyMetadata> {
         public_key,
         flags: info.flags,
     })
+}
+
+/// Extract assembly name from PE data with detailed error reporting.
+/// This is a debug-friendly version that returns specific error information.
+pub fn extract_assembly_name_from_metadata_debug(pe_data: &[u8]) -> Result<String, MetadataError> {
+    // Check DOS header
+    if pe_data.len() < 64 {
+        return Err(MetadataError::TooSmall);
+    }
+    if pe_data[0] != b'M' || pe_data[1] != b'Z' {
+        return Err(MetadataError::NoDosSignature);
+    }
+
+    // Get metadata bytes using our helper (which uses portex + CliHeader)
+    let metadata_bytes = extract_metadata_bytes(pe_data).ok_or(MetadataError::NoMetadata)?;
+
+    // Check BSJB signature
+    if metadata_bytes.len() < 4 || &metadata_bytes[0..4] != b"BSJB" {
+        return Err(MetadataError::NoBsjbSignature);
+    }
+
+    // Parse metadata using clrmeta
+    let metadata =
+        ClrMetadata::parse(metadata_bytes).map_err(|_| MetadataError::StreamParseError)?;
+
+    // Get assembly info
+    let info = metadata.assembly().ok_or(MetadataError::NoAssemblyTable)?;
+
+    Ok(info.name)
 }
 
 /// Count how many bits are set before position `bit` in the bitmask.
