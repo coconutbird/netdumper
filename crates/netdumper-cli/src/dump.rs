@@ -292,7 +292,8 @@ pub fn dump_assembly(
     // Try to extract the real assembly name from .NET metadata
     // If metadata is corrupted (NoBsjbSignature), try to repair using DAC metadata
     let (file_image, final_name) = match extract_assembly_name_from_metadata_debug(&file_image) {
-        Ok(name) => (file_image, name),
+        Ok(name) if !name.is_empty() => (file_image, name),
+        Ok(_) => (file_image, fallback_name.clone()), // Empty name, use fallback (module name from DAC)
         Err(MetadataError::NoBsjbSignature) => {
             eprintln!(
                 "  [INFO] {} - BSJB signature missing in PE, trying DAC metadata repair...",

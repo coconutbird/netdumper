@@ -1692,10 +1692,30 @@ pub fn extract_assembly_name_from_metadata_debug(pe_data: &[u8]) -> Result<Strin
     let metadata =
         ClrMetadata::parse(metadata_bytes).map_err(|_| MetadataError::StreamParseError)?;
 
-    // Get assembly info
-    let info = metadata.assembly().ok_or(MetadataError::NoAssemblyTable)?;
+    // Try assembly name first, then module name as fallback
+    if let Some(info) = metadata.assembly() {
+        if !info.name.is_empty() {
+            return Ok(info.name);
+        }
+    }
 
-    Ok(info.name)
+    // Fall back to module name (manifest module)
+    if let Some(module) = metadata.modules.first() {
+        if let Ok(name) = metadata.strings.get(module.name) {
+            let name = name.to_string();
+            // Module name typically ends with .dll or .exe, strip the extension
+            let name = name
+                .strip_suffix(".dll")
+                .or_else(|| name.strip_suffix(".exe"))
+                .unwrap_or(&name)
+                .to_string();
+            if !name.is_empty() {
+                return Ok(name);
+            }
+        }
+    }
+
+    Err(MetadataError::NoAssemblyTable)
 }
 
 /// Count how many bits are set before position `bit` in the bitmask.
