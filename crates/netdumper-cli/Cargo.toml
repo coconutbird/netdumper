@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+clrmeta = { git = "https://github.com/coconutbird/clrmeta.git" }
 portex = { git = "https://github.com/coconutbird/portex.git" }
 rayon = "1.11.0"
 sha1 = "0.10.6"

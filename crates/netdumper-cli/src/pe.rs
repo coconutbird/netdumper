@@ -8,6 +8,7 @@ use std::ffi::c_void;
 
 use crate::assembly::AssemblyMetadata;
 use crate::reader::ProcessMemoryReader;
+use clrmeta::{Metadata as ClrMetadata, MetadataRoot, StreamHeader};
 use portex::coff::{CoffHeader, characteristics as coff_chars};
 use portex::data_dir::{DataDirectory, DataDirectoryType};
 use portex::dos::DosHeader;
@@ -97,6 +98,54 @@ pub fn get_cli_directory_from_slice(pe_data: &[u8]) -> Option<CliHeaderInfo> {
         cli_file_offset,
         is_pe32_plus: headers.is_64bit(),
     })
+}
+
+/// Extract raw CLR metadata bytes from PE data using portex.
+/// Returns the metadata slice starting at the BSJB signature.
+fn extract_metadata_bytes(pe_data: &[u8]) -> Option<&[u8]> {
+    let headers = PEHeaders::from_slice(pe_data).ok()?;
+
+    // Get CLI Runtime data directory (index 14)
+    let cli_dir = headers
+        .optional_header
+        .data_directories()
+        .get(DataDirectoryType::ClrRuntime.as_index())?;
+
+    if cli_dir.virtual_address == 0 {
+        return None;
+    }
+
+    // Convert CLI header RVA to file offset
+    let cli_offset = headers.rva_to_offset(cli_dir.virtual_address)? as usize;
+
+    // Read CLI header - metadata RVA is at offset 8, size at offset 12
+    if cli_offset + 16 > pe_data.len() {
+        return None;
+    }
+
+    let metadata_rva = u32::from_le_bytes([
+        pe_data[cli_offset + 8],
+        pe_data[cli_offset + 9],
+        pe_data[cli_offset + 10],
+        pe_data[cli_offset + 11],
+    ]);
+
+    let metadata_size = u32::from_le_bytes([
+        pe_data[cli_offset + 12],
+        pe_data[cli_offset + 13],
+        pe_data[cli_offset + 14],
+        pe_data[cli_offset + 15],
+    ]) as usize;
+
+    if metadata_rva == 0 || metadata_size == 0 {
+        return None;
+    }
+
+    // Convert metadata RVA to file offset
+    let metadata_offset = headers.rva_to_offset(metadata_rva)? as usize;
+
+    // Return slice of metadata bytes
+    pe_data.get(metadata_offset..metadata_offset + metadata_size)
 }
 
 // =============================================================================
@@ -1845,82 +1894,34 @@ pub fn try_repair_metadata(metadata: &[u8]) -> Option<Vec<u8>> {
 /// Parse metadata streams from valid metadata.
 /// Returns stream locations if parsing succeeds.
 fn parse_metadata_streams(metadata: &[u8]) -> Option<MetadataStreamLocations> {
-    if metadata.len() < 16 || &metadata[0..4] != b"BSJB" {
-        return None;
-    }
-
-    let version_length =
-        u32::from_le_bytes([metadata[12], metadata[13], metadata[14], metadata[15]]) as usize;
-    let version_padded = (version_length + 3) & !3;
-    let streams_offset = 16 + version_padded;
-
-    if streams_offset + 4 > metadata.len() {
-        return None;
-    }
-
-    let num_streams =
-        u16::from_le_bytes([metadata[streams_offset + 2], metadata[streams_offset + 3]]) as usize;
+    let root = MetadataRoot::parse(metadata).ok()?;
 
     let mut locations = MetadataStreamLocations::default();
-    let mut pos = streams_offset + 4;
 
-    for _ in 0..num_streams {
-        if pos + 8 > metadata.len() {
-            break;
-        }
+    for stream in &root.streams {
+        let offset = stream.offset as usize;
+        let size = stream.size as usize;
 
-        let stream_offset = u32::from_le_bytes([
-            metadata[pos],
-            metadata[pos + 1],
-            metadata[pos + 2],
-            metadata[pos + 3],
-        ]) as usize;
-        let stream_size = u32::from_le_bytes([
-            metadata[pos + 4],
-            metadata[pos + 5],
-            metadata[pos + 6],
-            metadata[pos + 7],
-        ]) as usize;
-
-        pos += 8;
-
-        // Read stream name
-        let name_start = pos;
-        while pos < metadata.len() && metadata[pos] != 0 {
-            pos += 1;
-        }
-        let name = std::str::from_utf8(&metadata[name_start..pos]).unwrap_or("");
-        pos += 1;
-        pos = (pos + 3) & !3;
-
-        match name {
-            "#~" => {
-                locations.tilde_offset = stream_offset;
-                locations.tilde_size = stream_size;
-                locations.is_compressed = true;
-            }
-            "#-" => {
-                locations.tilde_offset = stream_offset;
-                locations.tilde_size = stream_size;
-                locations.is_compressed = false;
-            }
-            "#Strings" => {
-                locations.strings_offset = stream_offset;
-                locations.strings_size = stream_size;
-            }
-            "#US" => {
-                locations.us_offset = stream_offset;
-                locations.us_size = stream_size;
-            }
-            "#GUID" => {
-                locations.guid_offset = stream_offset;
-                locations.guid_size = stream_size;
-            }
-            "#Blob" => {
-                locations.blob_offset = stream_offset;
-                locations.blob_size = stream_size;
-            }
-            _ => {}
+        if stream.name == StreamHeader::TABLES {
+            locations.tilde_offset = offset;
+            locations.tilde_size = size;
+            locations.is_compressed = true;
+        } else if stream.name == StreamHeader::TABLES_UNCOMPRESSED {
+            locations.tilde_offset = offset;
+            locations.tilde_size = size;
+            locations.is_compressed = false;
+        } else if stream.name == StreamHeader::STRINGS {
+            locations.strings_offset = offset;
+            locations.strings_size = size;
+        } else if stream.name == StreamHeader::USER_STRINGS {
+            locations.us_offset = offset;
+            locations.us_size = size;
+        } else if stream.name == StreamHeader::GUID {
+            locations.guid_offset = offset;
+            locations.guid_size = size;
+        } else if stream.name == StreamHeader::BLOB {
+            locations.blob_offset = offset;
+            locations.blob_size = size;
         }
     }
 
@@ -2083,7 +2084,7 @@ pub enum MetadataError {
 
 /// Extract the assembly name with detailed error info for debugging
 pub fn extract_assembly_name_from_metadata_debug(pe_data: &[u8]) -> Result<String, MetadataError> {
-    // Parse DOS header
+    // Validate PE structure first for better error messages
     if pe_data.len() < 64 {
         return Err(MetadataError::TooSmall);
     }
@@ -2091,920 +2092,73 @@ pub fn extract_assembly_name_from_metadata_debug(pe_data: &[u8]) -> Result<Strin
         return Err(MetadataError::NoDosSignature);
     }
 
-    let e_lfanew =
-        u32::from_le_bytes([pe_data[0x3C], pe_data[0x3D], pe_data[0x3E], pe_data[0x3F]]) as usize;
+    // Extract metadata bytes using portex
+    let metadata_bytes = extract_metadata_bytes(pe_data).ok_or(MetadataError::NoCliHeader)?;
 
-    if e_lfanew + 24 > pe_data.len() {
-        return Err(MetadataError::InvalidPeOffset);
-    }
-
-    // Check PE signature
-    if pe_data.get(e_lfanew..e_lfanew + 4) != Some(b"PE\0\0".as_slice()) {
-        return Err(MetadataError::NoPeSignature);
-    }
-
-    // Parse COFF header
-    let coff_offset = e_lfanew + 4;
-    let size_of_optional_header =
-        u16::from_le_bytes([pe_data[coff_offset + 16], pe_data[coff_offset + 17]]) as usize;
-
-    if size_of_optional_header == 0 {
-        return Err(MetadataError::NoOptionalHeader);
-    }
-
-    // Parse optional header to find CLI header data directory
-    let opt_offset = coff_offset + 20;
-    let magic = u16::from_le_bytes([pe_data[opt_offset], pe_data[opt_offset + 1]]);
-
-    // PE32 = 0x10b, PE32+ = 0x20b
-    let is_pe32_plus = magic == 0x20b;
-    let data_dir_offset = if is_pe32_plus {
-        opt_offset + 112
-    } else {
-        opt_offset + 96
-    };
-
-    // CLI header is data directory entry 14 (COM Descriptor)
-    let cli_dir_offset = data_dir_offset + 14 * 8;
-    if cli_dir_offset + 8 > pe_data.len() {
-        return Err(MetadataError::NoCliHeader);
-    }
-
-    let cli_rva = u32::from_le_bytes([
-        pe_data[cli_dir_offset],
-        pe_data[cli_dir_offset + 1],
-        pe_data[cli_dir_offset + 2],
-        pe_data[cli_dir_offset + 3],
-    ]);
-
-    if cli_rva == 0 {
-        return Err(MetadataError::NoCliHeader);
-    }
-
-    // Convert RVA to file offset using section headers
-    let cli_offset = rva_to_file_offset(pe_data, e_lfanew, cli_rva as usize)
-        .ok_or(MetadataError::CliOffsetInvalid)?;
-
-    // Parse CLI header - we need metadata RVA at offset 8
-    if cli_offset + 16 > pe_data.len() {
-        return Err(MetadataError::CliOffsetInvalid);
-    }
-
-    let metadata_rva = u32::from_le_bytes([
-        pe_data[cli_offset + 8],
-        pe_data[cli_offset + 9],
-        pe_data[cli_offset + 10],
-        pe_data[cli_offset + 11],
-    ]) as usize;
-
-    let metadata_size = u32::from_le_bytes([
-        pe_data[cli_offset + 12],
-        pe_data[cli_offset + 13],
-        pe_data[cli_offset + 14],
-        pe_data[cli_offset + 15],
-    ]) as usize;
-
-    if metadata_rva == 0 || metadata_size == 0 {
-        return Err(MetadataError::NoMetadata);
-    }
-
-    let metadata_offset = rva_to_file_offset(pe_data, e_lfanew, metadata_rva)
-        .ok_or(MetadataError::MetadataOffsetInvalid)?;
-
-    if metadata_offset + metadata_size > pe_data.len() {
-        return Err(MetadataError::MetadataOffsetInvalid);
-    }
-
-    let metadata = &pe_data[metadata_offset..metadata_offset + metadata_size];
-
-    // Parse metadata root - check BSJB signature
-    if metadata.len() < 16 || metadata[0..4] != [0x42, 0x53, 0x4A, 0x42] {
+    // Check BSJB signature for specific error
+    if metadata_bytes.len() < 4 || &metadata_bytes[0..4] != b"BSJB" {
         return Err(MetadataError::NoBsjbSignature);
     }
 
-    // Continue with the rest of parsing (simplified - just check we can find streams)
-    let version_length =
-        u32::from_le_bytes([metadata[12], metadata[13], metadata[14], metadata[15]]) as usize;
-    let version_padded = (version_length + 3) & !3;
-    let streams_offset = 16 + version_padded;
+    // Parse with clrmeta
+    let metadata =
+        ClrMetadata::parse(metadata_bytes).map_err(|_| MetadataError::StreamParseError)?;
 
-    if streams_offset + 4 > metadata.len() {
-        return Err(MetadataError::StreamParseError);
-    }
-
-    // Use the full extraction logic
-    extract_assembly_name_from_metadata(pe_data).ok_or(MetadataError::NoAssemblyTable)
+    // Get assembly info
+    metadata
+        .assembly()
+        .map(|a| a.name)
+        .ok_or(MetadataError::NoAssemblyTable)
 }
 
 /// Extract the assembly name from .NET metadata in a PE file.
-/// This reads the Assembly table from the #~ stream and looks up the name in #Strings.
 /// Returns None if the file is not a .NET assembly or metadata is corrupted.
 pub fn extract_assembly_name_from_metadata(pe_data: &[u8]) -> Option<String> {
-    // Parse DOS header
-    if pe_data.len() < 64 || pe_data[0] != b'M' || pe_data[1] != b'Z' {
-        return None;
-    }
-
-    let e_lfanew =
-        u32::from_le_bytes([pe_data[0x3C], pe_data[0x3D], pe_data[0x3E], pe_data[0x3F]]) as usize;
-
-    if e_lfanew + 24 > pe_data.len() {
-        return None;
-    }
-
-    // Check PE signature
-    if pe_data.get(e_lfanew..e_lfanew + 4)? != b"PE\0\0" {
-        return None;
-    }
-
-    // Parse COFF header
-    let coff_offset = e_lfanew + 4;
-    let size_of_optional_header =
-        u16::from_le_bytes([pe_data[coff_offset + 16], pe_data[coff_offset + 17]]) as usize;
-
-    if size_of_optional_header == 0 {
-        return None;
-    }
-
-    // Parse optional header to find CLI header data directory
-    let opt_offset = coff_offset + 20;
-    let magic = u16::from_le_bytes([pe_data[opt_offset], pe_data[opt_offset + 1]]);
-
-    // PE32 = 0x10b, PE32+ = 0x20b
-    let is_pe32_plus = magic == 0x20b;
-    let data_dir_offset = if is_pe32_plus {
-        opt_offset + 112 // PE32+: 112 bytes to data directories
-    } else {
-        opt_offset + 96 // PE32: 96 bytes to data directories
-    };
-
-    // CLI header is data directory entry 14 (COM Descriptor)
-    let cli_dir_offset = data_dir_offset + 14 * 8;
-    if cli_dir_offset + 8 > pe_data.len() {
-        return None;
-    }
-
-    let cli_rva = u32::from_le_bytes([
-        pe_data[cli_dir_offset],
-        pe_data[cli_dir_offset + 1],
-        pe_data[cli_dir_offset + 2],
-        pe_data[cli_dir_offset + 3],
-    ]);
-
-    if cli_rva == 0 {
-        return None; // Not a .NET assembly
-    }
-
-    // Convert RVA to file offset using section headers
-    let cli_offset = rva_to_file_offset(pe_data, e_lfanew, cli_rva as usize)?;
-
-    // Parse CLI header (Cor20Header) - we need metadata RVA at offset 8
-    if cli_offset + 16 > pe_data.len() {
-        return None;
-    }
-
-    let metadata_rva = u32::from_le_bytes([
-        pe_data[cli_offset + 8],
-        pe_data[cli_offset + 9],
-        pe_data[cli_offset + 10],
-        pe_data[cli_offset + 11],
-    ]) as usize;
-
-    let metadata_size = u32::from_le_bytes([
-        pe_data[cli_offset + 12],
-        pe_data[cli_offset + 13],
-        pe_data[cli_offset + 14],
-        pe_data[cli_offset + 15],
-    ]) as usize;
-
-    if metadata_rva == 0 || metadata_size == 0 {
-        return None;
-    }
-
-    let metadata_offset = rva_to_file_offset(pe_data, e_lfanew, metadata_rva)?;
-
-    if metadata_offset + metadata_size > pe_data.len() {
-        return None;
-    }
-
-    let metadata = &pe_data[metadata_offset..metadata_offset + metadata_size];
-
-    // Parse metadata root - check BSJB signature
-    if metadata.len() < 16 || metadata[0..4] != [0x42, 0x53, 0x4A, 0x42] {
-        return None;
-    }
-
-    // Skip: signature(4) + major(2) + minor(2) + reserved(4) + version_length(4)
-    let version_length =
-        u32::from_le_bytes([metadata[12], metadata[13], metadata[14], metadata[15]]) as usize;
-
-    // Version string is padded to 4-byte boundary
-    let version_padded = (version_length + 3) & !3;
-    let streams_offset = 16 + version_padded;
-
-    if streams_offset + 4 > metadata.len() {
-        return None;
-    }
-
-    // Skip flags(2), read number of streams(2)
-    let num_streams =
-        u16::from_le_bytes([metadata[streams_offset + 2], metadata[streams_offset + 3]]) as usize;
-
-    // Parse stream headers to find #Strings and #~
-    let mut strings_offset = 0usize;
-    let mut strings_size = 0usize;
-    let mut tilde_offset = 0usize;
-    let mut tilde_size = 0usize;
-
-    let mut pos = streams_offset + 4;
-    for _ in 0..num_streams {
-        if pos + 8 > metadata.len() {
-            break;
-        }
-
-        let stream_offset = u32::from_le_bytes([
-            metadata[pos],
-            metadata[pos + 1],
-            metadata[pos + 2],
-            metadata[pos + 3],
-        ]) as usize;
-        let stream_size = u32::from_le_bytes([
-            metadata[pos + 4],
-            metadata[pos + 5],
-            metadata[pos + 6],
-            metadata[pos + 7],
-        ]) as usize;
-
-        pos += 8;
-
-        // Read stream name (null-terminated, padded to 4 bytes)
-        let name_start = pos;
-        while pos < metadata.len() && metadata[pos] != 0 {
-            pos += 1;
-        }
-        let name = std::str::from_utf8(&metadata[name_start..pos]).unwrap_or("");
-        pos += 1; // Skip null terminator
-        pos = (pos + 3) & !3; // Align to 4 bytes
-
-        match name {
-            "#Strings" => {
-                strings_offset = stream_offset;
-                strings_size = stream_size;
-            }
-            "#~" | "#-" => {
-                tilde_offset = stream_offset;
-                tilde_size = stream_size;
-            }
-            _ => {}
-        }
-    }
-
-    if strings_offset == 0 || tilde_offset == 0 {
-        return None;
-    }
-
-    // Parse #~ stream to find Assembly table
-    let tilde_data = metadata.get(tilde_offset..tilde_offset + tilde_size)?;
-    let strings_data = metadata.get(strings_offset..strings_offset + strings_size)?;
-
-    extract_assembly_name_from_tilde_stream(tilde_data, strings_data)
+    let metadata_bytes = extract_metadata_bytes(pe_data)?;
+    let metadata = ClrMetadata::parse(metadata_bytes).ok()?;
+    metadata.assembly().map(|a| a.name)
 }
 
-/// Parse the #~ stream and extract the assembly name from the Assembly table.
-/// Falls back to Module table name if Assembly table is not present.
-fn extract_assembly_name_from_tilde_stream(tilde: &[u8], strings: &[u8]) -> Option<String> {
-    // #~ stream header:
-    // Reserved: u32 (0)
-    // MajorVersion: u8
-    // MinorVersion: u8
-    // HeapSizes: u8 (bit 0 = #Strings uses 4 bytes, bit 1 = #GUID uses 4 bytes, bit 2 = #Blob uses 4 bytes)
-    // Reserved: u8
-    // Valid: u64 (bitmask of present tables)
-    // Sorted: u64
-    // Rows: u32[] (row count for each present table)
-
-    if tilde.len() < 24 {
-        return None;
-    }
-
-    let heap_sizes = tilde[6];
-    let string_idx_size = if heap_sizes & 0x01 != 0 { 4 } else { 2 };
-    let guid_idx_size = if heap_sizes & 0x02 != 0 { 4 } else { 2 };
-    let blob_idx_size = if heap_sizes & 0x04 != 0 { 4 } else { 2 };
-
-    let valid = u64::from_le_bytes([
-        tilde[8], tilde[9], tilde[10], tilde[11], tilde[12], tilde[13], tilde[14], tilde[15],
-    ]);
-
-    // Read row counts for all present tables
-    let mut pos = 24usize; // After header
-    let mut row_counts: Vec<u32> = Vec::new();
-
-    for i in 0..64 {
-        if valid & (1u64 << i) != 0 {
-            if pos + 4 > tilde.len() {
-                return None;
-            }
-            let count =
-                u32::from_le_bytes([tilde[pos], tilde[pos + 1], tilde[pos + 2], tilde[pos + 3]]);
-            row_counts.push(count);
-            pos += 4;
-        }
-    }
-
-    let tables_start = pos;
-
-    // Check if Assembly table (0x20) exists
-    let assembly_table_bit = 1u64 << 0x20;
-    let has_assembly_table = valid & assembly_table_bit != 0;
-
-    // Check if Module table (0x00) exists - it should always exist
-    let module_table_bit = 1u64 << 0x00;
-    let has_module_table = valid & module_table_bit != 0;
-
-    // Try Assembly table first, then fall back to Module table
-    if has_assembly_table
-        && let Some(name) = extract_name_from_assembly_table(
-            tilde,
-            strings,
-            &row_counts,
-            valid,
-            tables_start,
-            string_idx_size,
-            guid_idx_size,
-            blob_idx_size,
-        )
-    {
-        return Some(name);
-    }
-
-    // Fall back to Module table
-    if has_module_table
-        && let Some(name) =
-            extract_name_from_module_table(tilde, strings, tables_start, string_idx_size)
-    {
-        return Some(name);
-    }
-
-    None
-}
-
-/// Extract full assembly metadata from PE data.
+/// Extract full assembly metadata from PE data using clrmeta.
 /// Returns detailed information including version, culture, and public key token.
 pub fn extract_assembly_metadata(pe_data: &[u8]) -> Option<AssemblyMetadata> {
-    // Parse DOS header
-    if pe_data.len() < 64 || pe_data[0] != b'M' || pe_data[1] != b'Z' {
-        return None;
-    }
+    let metadata_bytes = extract_metadata_bytes(pe_data)?;
+    let metadata = ClrMetadata::parse(metadata_bytes).ok()?;
+    let info = metadata.assembly()?;
 
-    let e_lfanew =
-        u32::from_le_bytes([pe_data[0x3C], pe_data[0x3D], pe_data[0x3E], pe_data[0x3F]]) as usize;
-
-    if e_lfanew + 24 > pe_data.len() {
-        return None;
-    }
-
-    // Check PE signature
-    if pe_data.get(e_lfanew..e_lfanew + 4)? != b"PE\0\0" {
-        return None;
-    }
-
-    // Parse COFF header
-    let coff_offset = e_lfanew + 4;
-    let size_of_optional_header =
-        u16::from_le_bytes([pe_data[coff_offset + 16], pe_data[coff_offset + 17]]) as usize;
-
-    if size_of_optional_header == 0 {
-        return None;
-    }
-
-    // Parse optional header to find CLI header data directory
-    let opt_offset = coff_offset + 20;
-    let magic = u16::from_le_bytes([pe_data[opt_offset], pe_data[opt_offset + 1]]);
-
-    let is_pe32_plus = magic == 0x20b;
-    let data_dir_offset = if is_pe32_plus {
-        opt_offset + 112
-    } else {
-        opt_offset + 96
-    };
-
-    // CLI header is data directory entry 14
-    let cli_dir_offset = data_dir_offset + 14 * 8;
-    if cli_dir_offset + 8 > pe_data.len() {
-        return None;
-    }
-
-    let cli_rva = u32::from_le_bytes([
-        pe_data[cli_dir_offset],
-        pe_data[cli_dir_offset + 1],
-        pe_data[cli_dir_offset + 2],
-        pe_data[cli_dir_offset + 3],
-    ]);
-
-    if cli_rva == 0 {
-        return None;
-    }
-
-    let cli_offset = rva_to_file_offset(pe_data, e_lfanew, cli_rva as usize)?;
-
-    if cli_offset + 16 > pe_data.len() {
-        return None;
-    }
-
-    let metadata_rva = u32::from_le_bytes([
-        pe_data[cli_offset + 8],
-        pe_data[cli_offset + 9],
-        pe_data[cli_offset + 10],
-        pe_data[cli_offset + 11],
-    ]) as usize;
-
-    let metadata_size = u32::from_le_bytes([
-        pe_data[cli_offset + 12],
-        pe_data[cli_offset + 13],
-        pe_data[cli_offset + 14],
-        pe_data[cli_offset + 15],
-    ]) as usize;
-
-    if metadata_rva == 0 || metadata_size == 0 {
-        return None;
-    }
-
-    let metadata_offset = rva_to_file_offset(pe_data, e_lfanew, metadata_rva)?;
-
-    if metadata_offset + metadata_size > pe_data.len() {
-        return None;
-    }
-
-    let metadata = &pe_data[metadata_offset..metadata_offset + metadata_size];
-
-    // Check BSJB signature
-    if metadata.len() < 16 || &metadata[0..4] != b"BSJB" {
-        return None;
-    }
-
-    // Parse streams
-    let version_length =
-        u32::from_le_bytes([metadata[12], metadata[13], metadata[14], metadata[15]]) as usize;
-    let version_padded = (version_length + 3) & !3;
-    let streams_offset = 16 + version_padded;
-
-    if streams_offset + 4 > metadata.len() {
-        return None;
-    }
-
-    let num_streams =
-        u16::from_le_bytes([metadata[streams_offset + 2], metadata[streams_offset + 3]]) as usize;
-
-    let mut tilde_offset = 0usize;
-    let mut tilde_size = 0usize;
-    let mut strings_offset = 0usize;
-    let mut strings_size = 0usize;
-    let mut blob_offset = 0usize;
-    let mut blob_size = 0usize;
-
-    let mut pos = streams_offset + 4;
-    for _ in 0..num_streams {
-        if pos + 8 > metadata.len() {
-            break;
-        }
-
-        let stream_offset = u32::from_le_bytes([
-            metadata[pos],
-            metadata[pos + 1],
-            metadata[pos + 2],
-            metadata[pos + 3],
-        ]) as usize;
-        let stream_size = u32::from_le_bytes([
-            metadata[pos + 4],
-            metadata[pos + 5],
-            metadata[pos + 6],
-            metadata[pos + 7],
-        ]) as usize;
-
-        pos += 8;
-
-        let name_start = pos;
-        while pos < metadata.len() && metadata[pos] != 0 {
-            pos += 1;
-        }
-        let name = std::str::from_utf8(&metadata[name_start..pos]).unwrap_or("");
-        pos += 1;
-        pos = (pos + 3) & !3;
-
-        match name {
-            "#~" | "#-" => {
-                tilde_offset = stream_offset;
-                tilde_size = stream_size;
-            }
-            "#Strings" => {
-                strings_offset = stream_offset;
-                strings_size = stream_size;
-            }
-            "#Blob" => {
-                blob_offset = stream_offset;
-                blob_size = stream_size;
-            }
-            _ => {}
-        }
-    }
-
-    if tilde_size == 0 || strings_size == 0 {
-        return None;
-    }
-
-    let tilde_data = metadata.get(tilde_offset..tilde_offset + tilde_size)?;
-    let strings_data = metadata.get(strings_offset..strings_offset + strings_size)?;
-    let blob_data = if blob_size > 0 {
-        metadata.get(blob_offset..blob_offset + blob_size)
-    } else {
-        None
-    };
-
-    extract_full_assembly_metadata(tilde_data, strings_data, blob_data)
-}
-
-/// Extract full assembly metadata from the #~ stream.
-fn extract_full_assembly_metadata(
-    tilde: &[u8],
-    strings: &[u8],
-    blob: Option<&[u8]>,
-) -> Option<AssemblyMetadata> {
-    if tilde.len() < 24 {
-        return None;
-    }
-
-    let heap_sizes = tilde[6];
-    let string_idx_size = if heap_sizes & 0x01 != 0 { 4 } else { 2 };
-    let _guid_idx_size = if heap_sizes & 0x02 != 0 { 4 } else { 2 };
-    let blob_idx_size = if heap_sizes & 0x04 != 0 { 4 } else { 2 };
-
-    let valid = u64::from_le_bytes([
-        tilde[8], tilde[9], tilde[10], tilde[11], tilde[12], tilde[13], tilde[14], tilde[15],
-    ]);
-
-    // Read row counts
-    let mut pos = 24usize;
-    let mut row_counts: Vec<u32> = Vec::new();
-
-    for i in 0..64 {
-        if valid & (1u64 << i) != 0 {
-            if pos + 4 > tilde.len() {
-                return None;
-            }
-            let count =
-                u32::from_le_bytes([tilde[pos], tilde[pos + 1], tilde[pos + 2], tilde[pos + 3]]);
-            row_counts.push(count);
-            pos += 4;
-        }
-    }
-
-    let tables_start = pos;
-
-    // Check if Assembly table exists
-    let assembly_table_bit = 1u64 << 0x20;
-    if valid & assembly_table_bit == 0 {
-        return None;
-    }
-
-    // Calculate offset to Assembly table
-    let mut current_offset = tables_start;
-
-    for i in 0..0x20 {
-        if valid & (1u64 << i) != 0 {
-            let row_size = get_table_row_size(
-                i,
-                &row_counts,
-                valid,
-                string_idx_size,
-                _guid_idx_size,
-                blob_idx_size,
-            );
-            let table_index = count_bits_before(valid, i);
-            let row_count = *row_counts.get(table_index)? as usize;
-            current_offset += row_size * row_count;
-        }
-    }
-
-    // Now at Assembly table
-    // Assembly table row format (ECMA-335 II.22.2):
-    // HashAlgId: u32 (4)
-    // MajorVersion: u16 (2)
-    // MinorVersion: u16 (2)
-    // BuildNumber: u16 (2)
-    // RevisionNumber: u16 (2)
-    // Flags: u32 (4)
-    // PublicKey: Blob index
-    // Name: String index
-    // Culture: String index
-
-    if current_offset + 16 + blob_idx_size + string_idx_size * 2 > tilde.len() {
-        return None;
-    }
-
-    let row = &tilde[current_offset..];
-
-    let _hash_alg_id = u32::from_le_bytes([row[0], row[1], row[2], row[3]]);
-    let major_version = u16::from_le_bytes([row[4], row[5]]);
-    let minor_version = u16::from_le_bytes([row[6], row[7]]);
-    let build_number = u16::from_le_bytes([row[8], row[9]]);
-    let revision_number = u16::from_le_bytes([row[10], row[11]]);
-    let flags = u32::from_le_bytes([row[12], row[13], row[14], row[15]]);
-
-    let mut offset = 16;
-
-    // Read PublicKey blob index
-    let public_key_index = if blob_idx_size == 4 {
-        let idx = u32::from_le_bytes([
-            row[offset],
-            row[offset + 1],
-            row[offset + 2],
-            row[offset + 3],
-        ]);
-        offset += 4;
-        idx as usize
-    } else {
-        let idx = u16::from_le_bytes([row[offset], row[offset + 1]]);
-        offset += 2;
-        idx as usize
-    };
-
-    // Read Name string index
-    let name_index = if string_idx_size == 4 {
-        let idx = u32::from_le_bytes([
-            row[offset],
-            row[offset + 1],
-            row[offset + 2],
-            row[offset + 3],
-        ]);
-        offset += 4;
-        idx as usize
-    } else {
-        let idx = u16::from_le_bytes([row[offset], row[offset + 1]]);
-        offset += 2;
-        idx as usize
-    };
-
-    // Read Culture string index
-    let culture_index = if string_idx_size == 4 {
-        u32::from_le_bytes([
-            row[offset],
-            row[offset + 1],
-            row[offset + 2],
-            row[offset + 3],
-        ]) as usize
-    } else {
-        u16::from_le_bytes([row[offset], row[offset + 1]]) as usize
-    };
-
-    // Read name from #Strings
-    let name = read_string_at_index(strings, name_index)?;
-
-    // Read culture from #Strings
-    let culture = read_string_at_index(strings, culture_index).unwrap_or_default();
-
-    // Read public key from #Blob and compute token
-    let (public_key, public_key_token) = if let Some(blob_data) = blob {
-        read_public_key_and_token(blob_data, public_key_index)
-    } else {
-        (None, None)
-    };
+    // Extract values that require borrowing first
+    let public_key_token = info.public_key_token_string();
+    let public_key = info
+        .public_key
+        .map(|pk| pk.iter().map(|b| format!("{b:02x}")).collect());
 
     Some(AssemblyMetadata {
-        name,
-        major_version,
-        minor_version,
-        build_number,
-        revision_number,
-        culture,
+        name: info.name,
+        major_version: info.version.0,
+        minor_version: info.version.1,
+        build_number: info.version.2,
+        revision_number: info.version.3,
+        culture: info.culture.unwrap_or_default(),
         public_key_token,
         public_key,
-        flags,
+        flags: info.flags,
     })
-}
-
-/// Read a string from #Strings heap at the given index.
-fn read_string_at_index(strings: &[u8], index: usize) -> Option<String> {
-    if index >= strings.len() {
-        return None;
-    }
-
-    let name_bytes = &strings[index..];
-    let end = name_bytes
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(name_bytes.len());
-    let name = std::str::from_utf8(&name_bytes[..end]).ok()?;
-
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
-}
-
-/// Read public key from #Blob and compute public key token (SHA1 hash, last 8 bytes reversed).
-fn read_public_key_and_token(blob: &[u8], index: usize) -> (Option<String>, Option<String>) {
-    if index == 0 || index >= blob.len() {
-        return (None, None);
-    }
-
-    // Blob format: length prefix (compressed) followed by data
-    let (length, header_size) = read_compressed_uint(&blob[index..]);
-    if length == 0 {
-        return (None, None);
-    }
-
-    let data_start = index + header_size;
-    if data_start + length > blob.len() {
-        return (None, None);
-    }
-
-    let public_key_bytes = &blob[data_start..data_start + length];
-    let public_key_hex = bytes_to_hex(public_key_bytes);
-
-    // Compute public key token: SHA1 hash of public key, last 8 bytes reversed
-    let token = compute_public_key_token(public_key_bytes);
-
-    (Some(public_key_hex), token)
-}
-
-/// Read a compressed unsigned integer from blob data.
-/// Returns (value, bytes_consumed).
-fn read_compressed_uint(data: &[u8]) -> (usize, usize) {
-    if data.is_empty() {
-        return (0, 0);
-    }
-
-    let first = data[0];
-    if first & 0x80 == 0 {
-        // 1 byte: 0xxxxxxx
-        (first as usize, 1)
-    } else if first & 0xC0 == 0x80 {
-        // 2 bytes: 10xxxxxx xxxxxxxx
-        if data.len() < 2 {
-            return (0, 0);
-        }
-        let value = ((first & 0x3F) as usize) << 8 | data[1] as usize;
-        (value, 2)
-    } else if first & 0xE0 == 0xC0 {
-        // 4 bytes: 110xxxxx xxxxxxxx xxxxxxxx xxxxxxxx
-        if data.len() < 4 {
-            return (0, 0);
-        }
-        let value = ((first & 0x1F) as usize) << 24
-            | (data[1] as usize) << 16
-            | (data[2] as usize) << 8
-            | data[3] as usize;
-        (value, 4)
-    } else {
-        (0, 0)
-    }
-}
-
-/// Convert bytes to hex string.
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-/// Compute public key token from public key using SHA1.
-/// Token is last 8 bytes of SHA1 hash, reversed.
-fn compute_public_key_token(public_key: &[u8]) -> Option<String> {
-    use sha1::{Digest, Sha1};
-
-    if public_key.is_empty() {
-        return None;
-    }
-
-    // Compute SHA1 hash of the public key
-    let mut hasher = Sha1::new();
-    hasher.update(public_key);
-    let hash = hasher.finalize();
-
-    // Token is last 8 bytes of SHA1 hash, reversed
-    let token: Vec<u8> = hash[12..20].iter().rev().cloned().collect();
-    Some(bytes_to_hex(&token))
-}
-
-/// Extract name from the Assembly table (0x20).
-#[allow(clippy::too_many_arguments)]
-fn extract_name_from_assembly_table(
-    tilde: &[u8],
-    strings: &[u8],
-    row_counts: &[u32],
-    valid: u64,
-    tables_start: usize,
-    string_idx_size: usize,
-    guid_idx_size: usize,
-    blob_idx_size: usize,
-) -> Option<String> {
-    // Calculate offset to Assembly table by summing sizes of preceding tables
-    let mut current_offset = tables_start;
-
-    for i in 0..64 {
-        if valid & (1u64 << i) != 0 {
-            if i == 0x20 {
-                // Found Assembly table
-                // Assembly table row format (ECMA-335 II.22.2):
-                // HashAlgId: u32
-                // MajorVersion: u16
-                // MinorVersion: u16
-                // BuildNumber: u16
-                // RevisionNumber: u16
-                // Flags: u32
-                // PublicKey: Blob index
-                // Name: String index
-                // Culture: String index
-
-                let name_offset_in_row = 4 + 2 + 2 + 2 + 2 + 4 + blob_idx_size;
-                let name_pos = current_offset + name_offset_in_row;
-
-                return read_string_from_heap(tilde, strings, name_pos, string_idx_size);
-            }
-            // Calculate row size for this table
-            let row_size = get_table_row_size(
-                i,
-                row_counts,
-                valid,
-                string_idx_size,
-                guid_idx_size,
-                blob_idx_size,
-            );
-            let table_index = count_bits_before(valid, i);
-            let row_count = *row_counts.get(table_index)? as usize;
-            current_offset += row_size * row_count;
-        }
-    }
-
-    None
-}
-
-/// Extract name from the Module table (0x00).
-/// Module table row format (ECMA-335 II.22.30):
-/// - Generation: u16 (2 bytes)
-/// - Name: String index
-/// - Mvid: GUID index
-/// - EncId: GUID index
-/// - EncBaseId: GUID index
-fn extract_name_from_module_table(
-    tilde: &[u8],
-    strings: &[u8],
-    tables_start: usize,
-    string_idx_size: usize,
-) -> Option<String> {
-    // Module table is always table 0, so it starts right at tables_start
-    // Name is at offset 2 (after Generation: u16)
-    let name_offset_in_row = 2;
-    let name_pos = tables_start + name_offset_in_row;
-
-    read_string_from_heap(tilde, strings, name_pos, string_idx_size)
-}
-
-/// Read a string from the #Strings heap given a position in the tilde stream.
-fn read_string_from_heap(
-    tilde: &[u8],
-    strings: &[u8],
-    name_pos: usize,
-    string_idx_size: usize,
-) -> Option<String> {
-    if name_pos + string_idx_size > tilde.len() {
-        return None;
-    }
-
-    let name_index = if string_idx_size == 4 {
-        u32::from_le_bytes([
-            tilde[name_pos],
-            tilde[name_pos + 1],
-            tilde[name_pos + 2],
-            tilde[name_pos + 3],
-        ]) as usize
-    } else {
-        u16::from_le_bytes([tilde[name_pos], tilde[name_pos + 1]]) as usize
-    };
-
-    // Look up name in #Strings heap
-    if name_index >= strings.len() {
-        return None;
-    }
-
-    let name_bytes = &strings[name_index..];
-    let end = name_bytes
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(name_bytes.len());
-    let name = std::str::from_utf8(&name_bytes[..end]).ok()?;
-
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
 }
 
 /// Count how many bits are set before position `bit` in the bitmask.
 fn count_bits_before(valid: u64, bit: usize) -> usize {
     let mask = (1u64 << bit) - 1;
     (valid & mask).count_ones() as usize
+}
+
+/// Get simple table index size (2 or 4 bytes based on row count).
+fn simple_idx_size(row_counts: &[u32], valid: u64, table: usize) -> usize {
+    if valid & (1u64 << table) == 0 {
+        return 2;
+    }
+    let idx = count_bits_before(valid, table);
+    let count = row_counts.get(idx).copied().unwrap_or(0);
+    if count < 0x10000 { 2 } else { 4 }
 }
 
 /// Get the row size for a metadata table.
@@ -3039,8 +2193,8 @@ fn get_table_row_size(
     };
 
     // Coded index definitions from ECMA-335 II.24.2.6
-    let type_def_or_ref = || coded_idx_size(2, &[0x02, 0x01, 0x1B]); // TypeDef, TypeRef, TypeSpec
-    let has_constant = || coded_idx_size(2, &[0x04, 0x08, 0x17]); // Field, Param, Property
+    let type_def_or_ref = || coded_idx_size(2, &[0x02, 0x01, 0x1B]);
+    let has_constant = || coded_idx_size(2, &[0x04, 0x08, 0x17]);
     let has_custom_attribute = || {
         coded_idx_size(
             5,
@@ -3050,94 +2204,56 @@ fn get_table_row_size(
             ],
         )
     };
-    let has_field_marshal = || coded_idx_size(1, &[0x04, 0x08]); // Field, Param
-    let has_decl_security = || coded_idx_size(2, &[0x02, 0x06, 0x20]); // TypeDef, MethodDef, Assembly
-    let member_ref_parent = || coded_idx_size(3, &[0x02, 0x01, 0x1A, 0x06, 0x1B]); // TypeDef, TypeRef, ModuleRef, MethodDef, TypeSpec
-    let has_semantics = || coded_idx_size(1, &[0x14, 0x17]); // Event, Property
-    let method_def_or_ref = || coded_idx_size(1, &[0x06, 0x0A]); // MethodDef, MemberRef
-    let member_forwarded = || coded_idx_size(1, &[0x04, 0x06]); // Field, MethodDef
-    let _implementation = || coded_idx_size(2, &[0x26, 0x23, 0x27]); // File, AssemblyRef, ExportedType
-    let custom_attribute_type = || coded_idx_size(3, &[0x06, 0x0A]); // MethodDef, MemberRef (only 2 used, but 3 bits)
-    let resolution_scope = || coded_idx_size(2, &[0x00, 0x1A, 0x23, 0x01]); // Module, ModuleRef, AssemblyRef, TypeRef
+    let has_field_marshal = || coded_idx_size(1, &[0x04, 0x08]);
+    let has_decl_security = || coded_idx_size(2, &[0x02, 0x06, 0x20]);
+    let member_ref_parent = || coded_idx_size(3, &[0x02, 0x01, 0x1A, 0x06, 0x1B]);
+    let has_semantics = || coded_idx_size(1, &[0x14, 0x17]);
+    let method_def_or_ref = || coded_idx_size(1, &[0x06, 0x0A]);
+    let member_forwarded = || coded_idx_size(1, &[0x04, 0x06]);
+    let _implementation = || coded_idx_size(2, &[0x26, 0x23, 0x27]);
+    let custom_attribute_type = || coded_idx_size(3, &[0x06, 0x0A]);
+    let resolution_scope = || coded_idx_size(2, &[0x00, 0x1A, 0x23, 0x01]);
 
     match table {
-        // 0x00: Module - Generation(2) + Name(S) + Mvid(G) + EncId(G) + EncBaseId(G)
         0x00 => 2 + string_idx_size + guid_idx_size * 3,
-        // 0x01: TypeRef - ResolutionScope(coded) + TypeName(S) + TypeNamespace(S)
         0x01 => resolution_scope() + string_idx_size * 2,
-        // 0x02: TypeDef - Flags(4) + TypeName(S) + TypeNamespace(S) + Extends(coded) + FieldList(idx) + MethodList(idx)
         0x02 => {
             4 + string_idx_size * 2
                 + type_def_or_ref()
                 + simple_idx_size(row_counts, valid, 0x04)
                 + simple_idx_size(row_counts, valid, 0x06)
         }
-        // 0x04: Field - Flags(2) + Name(S) + Signature(B)
         0x04 => 2 + string_idx_size + blob_idx_size,
-        // 0x06: MethodDef - RVA(4) + ImplFlags(2) + Flags(2) + Name(S) + Signature(B) + ParamList(idx)
         0x06 => {
             4 + 2 + 2 + string_idx_size + blob_idx_size + simple_idx_size(row_counts, valid, 0x08)
         }
-        // 0x08: Param - Flags(2) + Sequence(2) + Name(S)
         0x08 => 2 + 2 + string_idx_size,
-        // 0x09: InterfaceImpl - Class(idx to TypeDef) + Interface(coded)
         0x09 => simple_idx_size(row_counts, valid, 0x02) + type_def_or_ref(),
-        // 0x0A: MemberRef - Class(coded) + Name(S) + Signature(B)
         0x0A => member_ref_parent() + string_idx_size + blob_idx_size,
-        // 0x0B: Constant - Type(2) + Parent(coded) + Value(B)
         0x0B => 2 + has_constant() + blob_idx_size,
-        // 0x0C: CustomAttribute - Parent(coded) + Type(coded) + Value(B)
         0x0C => has_custom_attribute() + custom_attribute_type() + blob_idx_size,
-        // 0x0D: FieldMarshal - Parent(coded) + NativeType(B)
         0x0D => has_field_marshal() + blob_idx_size,
-        // 0x0E: DeclSecurity - Action(2) + Parent(coded) + PermissionSet(B)
         0x0E => 2 + has_decl_security() + blob_idx_size,
-        // 0x0F: ClassLayout - PackingSize(2) + ClassSize(4) + Parent(idx to TypeDef)
         0x0F => 2 + 4 + simple_idx_size(row_counts, valid, 0x02),
-        // 0x10: FieldLayout - Offset(4) + Field(idx)
         0x10 => 4 + simple_idx_size(row_counts, valid, 0x04),
-        // 0x11: StandAloneSig - Signature(B)
         0x11 => blob_idx_size,
-        // 0x12: EventMap - Parent(idx to TypeDef) + EventList(idx to Event)
         0x12 => simple_idx_size(row_counts, valid, 0x02) + simple_idx_size(row_counts, valid, 0x14),
-        // 0x14: Event - EventFlags(2) + Name(S) + EventType(coded)
         0x14 => 2 + string_idx_size + type_def_or_ref(),
-        // 0x15: PropertyMap - Parent(idx to TypeDef) + PropertyList(idx to Property)
         0x15 => simple_idx_size(row_counts, valid, 0x02) + simple_idx_size(row_counts, valid, 0x17),
-        // 0x17: Property - Flags(2) + Name(S) + Type(B)
         0x17 => 2 + string_idx_size + blob_idx_size,
-        // 0x18: MethodSemantics - Semantics(2) + Method(idx to MethodDef) + Association(coded)
         0x18 => 2 + simple_idx_size(row_counts, valid, 0x06) + has_semantics(),
-        // 0x19: MethodImpl - Class(idx to TypeDef) + MethodBody(coded) + MethodDeclaration(coded)
         0x19 => {
             simple_idx_size(row_counts, valid, 0x02) + method_def_or_ref() + method_def_or_ref()
         }
-        // 0x1A: ModuleRef - Name(S)
         0x1A => string_idx_size,
-        // 0x1B: TypeSpec - Signature(B)
         0x1B => blob_idx_size,
-        // 0x1C: ImplMap - MappingFlags(2) + MemberForwarded(coded) + ImportName(S) + ImportScope(idx to ModuleRef)
         0x1C => 2 + member_forwarded() + string_idx_size + simple_idx_size(row_counts, valid, 0x1A),
-        // 0x1D: FieldRVA - RVA(4) + Field(idx)
         0x1D => 4 + simple_idx_size(row_counts, valid, 0x04),
-        // 0x1E: EncLog - Token(4) + FuncCode(4)
         0x1E => 4 + 4,
-        // 0x1F: EncMap - Token(4)
         0x1F => 4,
-        // 0x20: Assembly - HashAlgId(4) + Major(2) + Minor(2) + Build(2) + Rev(2) + Flags(4) + PublicKey(B) + Name(S) + Culture(S)
         0x20 => 4 + 2 + 2 + 2 + 2 + 4 + blob_idx_size + string_idx_size * 2,
         _ => 0,
     }
-}
-
-/// Get simple table index size (2 or 4 bytes based on row count).
-fn simple_idx_size(row_counts: &[u32], valid: u64, table: usize) -> usize {
-    if valid & (1u64 << table) == 0 {
-        return 2;
-    }
-    let idx = count_bits_before(valid, table);
-    let count = row_counts.get(idx).copied().unwrap_or(0);
-    if count < 0x10000 { 2 } else { 4 }
 }
 
 /// Convert an RVA to a file offset using section headers.
