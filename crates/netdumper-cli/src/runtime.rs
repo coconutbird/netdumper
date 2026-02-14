@@ -276,25 +276,32 @@ pub fn find_runtime_directory(handle: HANDLE) -> Result<Option<RuntimeInfo>> {
 }
 
 /// Check if an executable has CLR exports (indicating embedded CoreCLR)
+/// Uses portex to efficiently parse only the export directory instead of reading the entire file.
 pub fn exe_has_clr_exports(path: &PathBuf) -> bool {
-    let Ok(data) = std::fs::read(path) else {
+    use portex::PE;
+
+    let Ok(pe) = PE::from_file(path) else {
         return false;
     };
 
-    let clr_export_signatures: &[&[u8]] = &[
-        b"g_dacTable",
-        b"DotNetRuntimeInfo",
-        b"MetaDataGetDispenser",
-        b"g_CLREngineMetrics",
+    // Get exports via portex
+    let Ok(export_table) = pe.exports() else {
+        return false;
+    };
+
+    // CLR export names that indicate embedded CoreCLR
+    const CLR_EXPORTS: &[&str] = &[
+        "g_dacTable",
+        "DotNetRuntimeInfo",
+        "MetaDataGetDispenser",
+        "g_CLREngineMetrics",
     ];
 
-    for sig in clr_export_signatures {
-        if data.windows(sig.len()).any(|w| w == *sig) {
-            return true;
-        }
-    }
-
-    false
+    export_table
+        .exports
+        .iter()
+        .filter_map(|func| func.name.as_ref())
+        .any(|name| CLR_EXPORTS.contains(&name.as_str()))
 }
 
 /// Find a .NET Core runtime installation on the system
@@ -512,50 +519,20 @@ pub fn diagnose_process(pid: u32) -> Result<DiagnosticInfo> {
 }
 
 /// Check if a PE file has a CLR header
+/// Uses portex to efficiently parse only headers instead of reading the entire file.
 fn check_pe_has_clr_header(path: &PathBuf) -> bool {
-    let Ok(data) = std::fs::read(path) else {
+    use portex::{DataDirectoryType, PEHeaders};
+
+    let Ok(headers) = PEHeaders::from_file(path) else {
         return false;
     };
 
-    if data.len() < 64 || data[0] != 0x4D || data[1] != 0x5A {
-        return false;
-    }
-
-    let e_lfanew = u32::from_le_bytes([data[0x3C], data[0x3D], data[0x3E], data[0x3F]]) as usize;
-    if e_lfanew + 4 > data.len() || data[e_lfanew] != 0x50 || data[e_lfanew + 1] != 0x45 {
-        return false;
-    }
-
-    let opt_header_offset = e_lfanew + 24;
-    if opt_header_offset + 2 > data.len() {
-        return false;
-    }
-
-    let magic = u16::from_le_bytes([data[opt_header_offset], data[opt_header_offset + 1]]);
-    let clr_dir_offset = match magic {
-        0x10B => opt_header_offset + 208,
-        0x20B => opt_header_offset + 224,
-        _ => return false,
-    };
-
-    if clr_dir_offset + 8 > data.len() {
-        return false;
-    }
-
-    let clr_rva = u32::from_le_bytes([
-        data[clr_dir_offset],
-        data[clr_dir_offset + 1],
-        data[clr_dir_offset + 2],
-        data[clr_dir_offset + 3],
-    ]);
-    let clr_size = u32::from_le_bytes([
-        data[clr_dir_offset + 4],
-        data[clr_dir_offset + 5],
-        data[clr_dir_offset + 6],
-        data[clr_dir_offset + 7],
-    ]);
-
-    clr_rva != 0 && clr_size != 0
+    // Check if the CLR runtime data directory is present
+    headers
+        .optional_header
+        .data_directories()
+        .get(DataDirectoryType::ClrRuntime.as_index())
+        .is_some_and(|dir| dir.is_present())
 }
 
 /// Get the embedded CLR version from a process

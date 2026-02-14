@@ -188,8 +188,8 @@ impl ProcessInfo {
 
         let machine_type = if let Some(clr_base) = clr_base_address {
             // Read from CLR module - this is the actual runtime architecture
-            read_machine_type_from_process(handle.as_raw(), clr_base as usize)
-                .unwrap_or_else(|| {
+            read_machine_type_from_process(handle.as_raw(), clr_base as usize).unwrap_or_else(
+                || {
                     // Fall back to main exe
                     if exe_base_address != 0 {
                         read_machine_type_from_process(handle.as_raw(), exe_base_address as usize)
@@ -197,7 +197,8 @@ impl ProcessInfo {
                     } else {
                         default_machine_type()
                     }
-                })
+                },
+            )
         } else if exe_base_address != 0 {
             read_machine_type_from_process(handle.as_raw(), exe_base_address as usize)
                 .unwrap_or(default_machine_type())
