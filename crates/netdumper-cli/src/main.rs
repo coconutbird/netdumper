@@ -154,6 +154,9 @@ fn main() {
                                 asm.metadata_address, asm.metadata_size
                             );
                         }
+                        if asm.module_address != 0 {
+                            println!("    Module: 0x{:X}", asm.module_address);
+                        }
                         if let Some(path) = &asm.path {
                             println!("    Path: {}", path);
                         }

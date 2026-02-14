@@ -268,7 +268,8 @@ pub fn dump_assembly(
             };
         }
 
-        let use_reconstruction = needs_reconstruction || is_pe_header_corrupted(&buffer);
+        let header_corrupted = is_pe_header_corrupted(&buffer);
+        let use_reconstruction = needs_reconstruction || header_corrupted;
 
         let pe_data = if use_reconstruction {
             let reconstructed_info = if needs_reconstruction {
@@ -328,10 +329,6 @@ pub fn dump_assembly(
                         );
                         Some(repaired)
                     } else {
-                        eprintln!(
-                            "  [DEBUG] {} - DAC metadata also corrupted, cannot repair",
-                            fallback_name
-                        );
                         None
                     };
 
@@ -355,20 +352,13 @@ pub fn dump_assembly(
                         (file_image, fallback_name.clone())
                     }
                 } else {
-                    eprintln!("  [DEBUG] {} - Failed to read DAC metadata", fallback_name);
                     (file_image, fallback_name.clone())
                 }
             } else {
                 (file_image, fallback_name.clone())
             }
         }
-        Err(e) => {
-            eprintln!(
-                "  [DEBUG] {} metadata error: {:?} (cli_valid={})",
-                fallback_name, e, cli_valid
-            );
-            (file_image, fallback_name.clone())
-        }
+        Err(_) => (file_image, fallback_name.clone()),
     };
     let safe_name = sanitize_filename(&final_name);
     // Use .exe extension if assembly has entry point, .dll otherwise
